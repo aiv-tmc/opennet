@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+# OpenRC service script for the OpenNet daemon.
+# Install:  cp init/opennetd.openrc /etc/init.d/opennetd && rc-update add opennetd default
+
+command=/usr/local/bin/opennetd
+command_background=true
+pidfile=/run/opennetd.pid
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    # Ensure the state and runtime directories exist and are writable.
+    checkpath -d -m 0755 -o root:root /var/lib/opennet /run/opennet
+}

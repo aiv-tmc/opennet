@@ -1,0 +1,22 @@
+# systemd unit for the OpenNet daemon.
+# Install:  cp init/opennetd.service /etc/systemd/system/ && systemctl daemon-reload
+[Unit]
+Description=OpenNet distributed computing daemon
+Documentation=https://github.com/aiv-tmc/OpenNet
+After=network.target
+
+[Service]
+Type=notify
+# StateDirectory creates /var/lib/opennet, RuntimeDirectory creates /run/opennet.
+StateDirectory=opennet
+RuntimeDirectory=opennet
+ExecStart=/usr/local/bin/opennetd
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
