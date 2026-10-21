@@ -117,3 +117,54 @@ impl Message {
             .expect("payload serialization failed")
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_ping() {
+        let msg = Message::Ping;
+        let bytes = msg.encode();
+        assert!(matches!(Message::decode(&bytes), Some(Message::Ping)));
+    }
+
+    #[test]
+    fn roundtrip_task_bid() {
+        let msg = Message::TaskBid {
+            task_id: "abc".into(),
+            offer: 42,
+            expires_unix: 1000,
+        };
+        let bytes = msg.encode();
+        match Message::decode(&bytes) {
+            Some(Message::TaskBid {
+                task_id,
+                offer,
+                expires_unix,
+            }) => {
+                assert_eq!(task_id, "abc");
+                assert_eq!(offer, 42);
+                assert_eq!(expires_unix, 1000);
+            }
+            _ => panic!("decode failed"),
+        }
+    }
+
+    #[test]
+    fn signing_payloads_are_stable() {
+        let a = Message::ann_signing_payload("nid", "peer", 100);
+        let b = Message::ann_signing_payload("nid", "peer", 100);
+        assert_eq!(a, b);
+        let c = Message::credit_signing_payload("t1", "from", "to", 5);
+        let d = Message::credit_signing_payload("t1", "from", "to", 5);
+        assert_eq!(c, d);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn decode_rejects_garbage() {
+        assert!(Message::decode(&[0xff, 0x00, 0x01]).is_none());
+    }
+}

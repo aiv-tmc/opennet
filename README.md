@@ -34,7 +34,7 @@ Switch at runtime: `opennetctl mode seed` (persisted across restarts).
 ## Quick start (zero configuration)
 
 ```sh
-$ git clone https://github.com/aiv-tmc/OpenNet.git && cd OpenNet
+$ $ git clone https://github.com/aiv-tmc/opennet.git && cd opennet
 $ ./install.sh            # builds, installs, enables and starts the service
 $ opennetctl status       # check the node
 ```
@@ -141,9 +141,10 @@ The systemd unit uses `Type=notify` readiness plus sandboxing
 
 ## Roadmap
 
-1. Daemon skeleton: config, control socket, init system integration.
-2. Credit ledger: signed transfers, reputation tracking.
-3. Capacity market: bids, priority scheduling, task execution
-   (current milestone).
-4. Sandboxed execution (namespaces + cgroups v2) and result verification.
+1. Daemon skeleton: config, control socket, init system integration. **done**
+2. Credit ledger: signed transfers, reputation tracking. **done**
+3. Capacity market: bids, priority scheduling, task execution. **done (hardening ongoing)**
+4. Sandboxed execution (namespaces + cgroups v2) and result verification. **planned**
+
+See `CHANGELOG.md` for recent fixes (TCP transport, task kill-on-timeout, docs).
 
