@@ -102,7 +102,8 @@ impl Dht {
     /// All known peers ordered by freshness, most recent first.
     pub fn all_peers(&self) -> Vec<PeerInfo> {
         let mut peers: Vec<PeerInfo> = self.routing_table.values().cloned().collect();
-        peers.sort_by_key(|peer| peer.last_seen);
+        // Freshest first
+        peers.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         peers
     }
 
