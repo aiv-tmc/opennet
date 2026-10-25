@@ -1,0 +1,188 @@
+# Continuous integration for OpenNet.
+#
+# Every push and pull request is checked for formatting, lint cleanliness,
+# passing tests and a successful release build. A smoke job additionally
+# boots the real daemon with a temporary configuration and drives it
+# through the control socket, so regressions in startup, state handling
+# and shutdown are caught before they reach a release.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Static quality gate: the tree must be rustfmt-clean and clippy-clean
+  # with warnings denied, matching the contribution requirements.
+  quality:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the stable toolchain with rustfmt and clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache compiled dependencies between runs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify rustfmt-clean tree
+        run: cargo fmt --all -- --check
+
+      - name: Verify clippy-clean tree (warnings are errors)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # The test suite exercises the trust economy, the transport, the executor
+  # and end-to-end market flows over real loopback TCP. Linux is the
+  # primary platform; macOS is included to catch portability regressions
+  # (the code intentionally avoids Linux-only APIs at runtime).
+  test:
+    name: Tests (${{ matrix.os }})
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache compiled dependencies between runs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the full test suite
+        run: cargo test --all-features --verbose
+
+  # The release profile uses LTO and codegen-units=1, which is a different
+  # code path than the dev profile; build it explicitly so a broken release
+  # build never reaches the release workflow.
+  build:
+    name: Release build
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache compiled dependencies between runs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build with the release profile
+        run: cargo build --release --verbose
+
+      - name: Upload the binaries as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opennet-binaries-${{ github.sha }}
+          path: |
+            target/release/opennetd
+            target/release/opennetctl
+          if-no-files-found: error
+
+  # Boot the real daemon with a scratch configuration and drive it through
+  # the control socket: status must report the genesis trust, shutdown must
+  # stop the process cleanly and the state file must persist afterwards.
+  smoke:
+    name: Daemon smoke test
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache compiled dependencies between runs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the daemon and the control client
+        run: cargo build --release
+
+      - name: Create a scratch configuration with temporary paths
+        run: |
+          mkdir -p /tmp/opennet-smoke
+          ./target/release/opennetd --print-default-config > /tmp/opennet-smoke/config.toml
+          sed -i 's|/var/lib/opennet|/tmp/opennet-smoke/state|' /tmp/opennet-smoke/config.toml
+          sed -i 's|/run/opennet/control.sock|/tmp/opennet-smoke/control.sock|' /tmp/opennet-smoke/config.toml
+          cat /tmp/opennet-smoke/config.toml
+
+      - name: Start the daemon in the background
+        run: |
+          ./target/release/opennetd --config /tmp/opennet-smoke/config.toml &
+          echo $! > /tmp/opennet-smoke/daemon.pid
+
+      - name: Wait for the control socket to appear
+        run: |
+          for attempt in $(seq 1 30); do
+            if [ -S /tmp/opennet-smoke/control.sock ]; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat /tmp/opennet-smoke/daemon.pid)" 2>/dev/null; then
+              echo "daemon exited before creating the control socket" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "control socket never appeared" >&2
+          exit 1
+
+      - name: Query the node status through the control socket
+        env:
+          OPENNET_SOCKET: /tmp/opennet-smoke/control.sock
+        run: |
+          status=$(./target/release/opennetctl status)
+          echo "$status"
+          grep -q "mode: peer" <<<"$status"
+          grep -q "trust: 100" <<<"$status"
+          grep -q "consumed: 0" <<<"$status"
+
+      - name: Shut the daemon down gracefully via the control socket
+        env:
+          OPENNET_SOCKET: /tmp/opennet-smoke/control.sock
+        run: |
+          ./target/release/opennetctl shutdown
+          for attempt in $(seq 1 15); do
+            if ! kill -0 "$(cat /tmp/opennet-smoke/daemon.pid)" 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "daemon ignored the shutdown command" >&2
+          exit 1
+
+      - name: Verify the state file was persisted
+        run: test -f /tmp/opennet-smoke/state/state.json
+
+  # Audit the dependency tree against the RustSec advisory database.
+  # Requires Cargo.lock to be committed, which this binary crate does.
+  audit:
+    name: Security audit
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run the advisory audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
