@@ -1,8 +1,6 @@
 //! Local control interface: a Unix socket accepting one command per line.
 
 use crate::compute;
-use crate::credits::ledger::TransferKind;
-use crate::credits::transfer::send_transfer;
 use crate::daemon::Ctx;
 use crate::node::state::Mode;
 use anyhow::{Context, Result};
@@ -64,12 +62,11 @@ async fn dispatch(ctx: &Arc<Ctx>, command: &str) -> String {
         ("mode", Some(name), None) => set_mode(ctx, name).await,
         ("peers", None, None) => peers(ctx).await,
         ("limits", None, None) => limits(ctx).await,
-        ("transfer", Some(peer), Some(amount)) => send_transfer(ctx, peer, amount).await,
-        ("compute", Some(peer_token), Some(offer_text)) => {
+        ("compute", Some(peer_token), _) => {
             let command_text = parts.collect::<Vec<_>>().join(" ");
-            compute_cmd(ctx, peer_token, offer_text, &command_text).await
+            compute_cmd(ctx, peer_token, &command_text).await
         }
-        ("ledger", count, None) => ledger(ctx, count).await,
+        ("trust", None, None) => trust(ctx).await,
         ("reputation", None, None) => reputation(ctx).await,
         ("shutdown", None, None) => {
             let _ = ctx.shutdown.send(true);
@@ -83,15 +80,16 @@ async fn dispatch(ctx: &Arc<Ctx>, command: &str) -> String {
 async fn status(ctx: &Arc<Ctx>) -> String {
     let state = ctx.state.lock().await;
     let dht = ctx.dht.lock().await;
-    let pending = ctx.pending.lock().await.len();
-    let queued = ctx.running_tasks.load(std::sync::atomic::Ordering::Relaxed);
+    let reserved = ctx.reservations.lock().await.len();
     format!(
-        "node_id: {node}\nmode: {mode}\ncredits: {credits}\npending_transfers: {pending}\ntasks_running: {queued}\ntasks_completed: {done}\ntasks_failed: {failed}\nuptime_secs: {uptime}\npeers: {peers}\nmsgs_sent: {sent}\nmsgs_received: {recv}\nlimits: cpu={cpu}% ram={ram}MB tasks={tasks}\n",
+        "node_id: {node}\nmode: {mode}\ntrust: {trust}\nconsumed: {consumed}\npoints: {points}\nreservations: {reserved}\ntasks_running: {queued}\ntasks_completed: {done}\ntasks_failed: {failed}\nuptime_secs: {uptime}\npeers: {peers}\nmsgs_sent: {sent}\nmsgs_received: {recv}\nlimits: cpu={cpu}% ram={ram}MB tasks={tasks}\n",
         node = ctx.identity.node_id(),
         mode = state.mode.as_str(),
-        credits = state.credits,
-        pending = pending,
-        queued = queued,
+        trust = state.trust,
+        consumed = state.consumed,
+        points = state.points,
+        reserved = reserved,
+        queued = ctx.running_tasks.load(std::sync::atomic::Ordering::Relaxed),
         done = state.tasks_completed,
         failed = state.tasks_failed,
         uptime = state.uptime().as_secs(),
@@ -119,113 +117,102 @@ async fn set_mode(ctx: &Arc<Ctx>, name: &str) -> String {
     }
 }
 
-/// Submit one compute task to the market; `-` selects the peer automatically.
-async fn compute_cmd(
-    ctx: &Arc<Ctx>,
-    peer_token: &str,
-    offer_text: &str,
-    command_text: &str,
-) -> String {
-    if command_text.is_empty() {
-        return "error: usage: compute <node_prefix|-> <offer> <command...>\n".to_string();
-    }
-    let offer: u64 = match offer_text.parse() {
-        Ok(offer) => offer,
-        Err(_) => return format!("error: invalid offer '{offer_text}'\n"),
-    };
-    let prefix = if peer_token == "-" {
-        None
-    } else {
-        Some(peer_token)
-    };
-    let timeout_secs = ctx.config.network.task_timeout_secs;
-    compute::client::compute(ctx, prefix, offer, command_text.to_string(), timeout_secs).await
-}
-
-/// Show the most recent transfer log entries (default 10, max 100).
-async fn ledger(ctx: &Arc<Ctx>, count: Option<&str>) -> String {
-    let limit: usize = count
-        .and_then(|text| text.parse().ok())
-        .unwrap_or(10)
-        .clamp(1, 100);
-    let ledger = ctx.ledger.lock().await;
-    let entries = ledger.tail(limit);
-    if entries.is_empty() {
-        return "no transfers recorded\n".to_string();
-    }
-    let mut out = String::new();
-    for record in entries {
-        let kind = match record.kind {
-            TransferKind::Outgoing => "out",
-            TransferKind::Incoming => "in",
-            TransferKind::Refund => "refund",
-        };
-        out.push_str(&format!(
-            "  {} {kind:>6} {} credits with {} at {}\n",
-            record.task_id,
-            record.amount,
-            record.counterparty,
-            record.unix_ts
-        ));
-    }
-    out
-}
-
-/// Show the local reputation table for all known peers.
-async fn reputation(ctx: &Arc<Ctx>) -> String {
-    let table = ctx.reputation.lock().await;
-    let entries = table.all();
-    if entries.is_empty() {
-        return "no reputation data yet\n".to_string();
-    }
-    let mut out = String::new();
-    for (peer, rep) in entries {
-        out.push_str(&format!(
-            "  {peer} score={} valid={} invalid={} in={} out={}\n",
-            rep.score(),
-            rep.valid_msgs,
-            rep.invalid_msgs,
-            rep.credits_in,
-            rep.credits_out
-        ));
-    }
-    out
-}
-
-/// List all known peers with their announced parameters and age.
+/// List known peers with their verified announcement fields.
 async fn peers(ctx: &Arc<Ctx>) -> String {
     let peers = ctx.dht.lock().await.all_peers();
     if peers.is_empty() {
         return "no peers known\n".to_string();
     }
-    let mut out = format!("{} peer(s), freshest first:\n", peers.len());
+    let mut out = String::from("node_id addr mode trust points age_secs\n");
     for peer in peers {
-        let node_id = if peer.node_id.is_empty() {
+        let id = if peer.node_id.is_empty() {
             "-"
         } else {
             &peer.node_id
         };
         out.push_str(&format!(
-            "  {node_id} {} mode={} credits={} last_seen={}s ago\n",
+            "{id} {} {} {} {} {}\n",
             peer.addr,
             peer.mode,
-            peer.credits,
+            peer.trust,
+            peer.points,
             peer.last_seen.elapsed().as_secs()
         ));
     }
     out
 }
 
-/// Show the resource limits this node offers to the network.
+/// Show resource limits and capacity pricing parameters.
 async fn limits(ctx: &Arc<Ctx>) -> String {
     let state = ctx.state.lock().await;
     format!(
-        "cpu_percent: {}\nram_mb: {}\nmax_tasks: {}\n",
-        state.limits.cpu_percent, state.limits.ram_mb, state.limits.max_tasks
+        "limits: cpu={cpu}% ram={ram}MB tasks={tasks}\ncapacity: {points} points ({ppc}/core {ppg}/GiB)\ntrust: genesis={genesis} min={min}\n",
+        cpu = state.limits.cpu_percent,
+        ram = state.limits.ram_mb,
+        tasks = state.limits.max_tasks,
+        points = state.points,
+        ppc = ctx.config.trust.points_per_core,
+        ppg = ctx.config.trust.points_per_gb,
+        genesis = ctx.config.trust.genesis_trust,
+        min = ctx.config.trust.min_trust,
     )
 }
 
-/// Command summary served for `help` and empty commands.
-fn help() -> String {
-    "commands:\n  status                  show node overview\n  mode [peer|seed|leech]  show or set operating mode\n  peers                   list known peers\n  limits                  show resource limits\n  transfer <node_prefix> <amount>\n                          send signed credits to a peer\n  compute <node_prefix|-> <offer> <command...>\n                          run a command on a peer and pay on success\n  ledger [count]          show recent transfers (default 10)\n  reputation              show peer reputation table\n  shutdown                stop the daemon\n".to_string()
+/// Submit one compute task to the market; `-` selects the peer
+/// automatically. The task price is derived from the provider's capacity
+/// points, so no manual offer is needed.
+async fn compute_cmd(ctx: &Arc<Ctx>, peer_token: &str, command_text: &str) -> String {
+    if command_text.is_empty() {
+        return "error: usage: compute <node_prefix|-> <command...>\n".to_string();
+    }
+    let prefix = if peer_token == "-" {
+        None
+    } else {
+        Some(peer_token)
+    };
+    let timeout_secs = ctx.config.network.task_timeout_secs;
+    compute::client::compute(ctx, prefix, command_text.to_string(), timeout_secs).await
 }
+
+/// Show the local trust coefficient, consumption counter and reservations.
+async fn trust(ctx: &Arc<Ctx>) -> String {
+    let state = ctx.state.lock().await;
+    let reservations = ctx.reservations.lock().await;
+    let reserved: i64 = reservations.values().sum();
+    format!(
+        "trust: {}\nconsumed: {}\npoints: {}\nreserved: {} ({} tasks)\n",
+        state.trust,
+        state.consumed,
+        state.points,
+        reserved,
+        reservations.len()
+    )
+}
+
+/// Render the peer reputation table.
+async fn reputation(ctx: &Arc<Ctx>) -> String {
+    let table = ctx.reputation.lock().await;
+    let entries = table.all();
+    if entries.is_empty() {
+        return "no reputation data recorded\n".to_string();
+    }
+    let mut out = String::from("peer valid invalid score\n");
+    for (peer, rep) in entries {
+        out.push_str(&format!(
+            "{peer} {} {} {}\n",
+            rep.valid_msgs,
+            rep.invalid_msgs,
+            rep.score()
+        ));
+    }
+    out
+}
+
+/// List all supported commands.
+fn help() -> String {
+    "commands:\n  status                              node id, mode, trust, task and peer counters\n  mode [peer|seed|leech]              show or set operating mode\n  peers                               known peers with node id, mode, trust, points, age\n  limits                              resource limits and capacity pricing\n  compute <node_prefix|-> <command...>   run a command on a peer\n  trust                               trust coefficient, consumption and reservations\n  reputation                          peer reputation table\n  shutdown                            stop the daemon gracefully\n"
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests;

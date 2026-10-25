@@ -1,14 +1,12 @@
-//! Runtime node state: operating mode, credit balance, task statistics.
+//! Runtime node state: operating mode, trust coefficient, consumption
+//! counter, capacity points and task statistics.
 
-use crate::config::Limits;
+use crate::config::{Limits, TrustCfg};
+use crate::trust::points::compute_points;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-
-/// Credits granted to a fresh node so the market can bootstrap without an
-/// external faucet; earned credits replace this endowment over time.
-pub const GENESIS_CREDITS: u64 = 100;
 
 /// How the node participates in the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,7 +14,7 @@ pub const GENESIS_CREDITS: u64 = 100;
 pub enum Mode {
     /// Give and take compute capacity.
     Peer,
-    /// Only donate capacity and accumulate credits.
+    /// Only donate capacity and accumulate trust.
     Seed,
     /// Only consume capacity from the network.
     Leech,
@@ -47,7 +45,8 @@ impl Mode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     mode: Mode,
-    credits: u64,
+    trust: i64,
+    consumed: u64,
     #[serde(default)]
     tasks_completed: u64,
     #[serde(default)]
@@ -57,8 +56,15 @@ struct PersistedState {
 /// Mutable runtime state shared across daemon tasks.
 pub struct NodeState {
     pub mode: Mode,
-    /// Credit balance earned by donating capacity to the network.
-    pub credits: u64,
+    /// Trust coefficient earned by donating compute and spent by consuming
+    /// it; providers gate acceptance on this value as last announced.
+    pub trust: i64,
+    /// Cumulative trust units consumed on remote providers, announced in
+    /// every bid so providers can audit the claimed trust arithmetic.
+    pub consumed: u64,
+    /// Static capacity price of this node's hardware, announced to peers
+    /// and used to charge consumers for executed tasks.
+    pub points: u32,
     /// Total wire messages sent to peers.
     pub msgs_sent: u64,
     /// Total wire messages received from peers.
@@ -75,30 +81,36 @@ pub struct NodeState {
 
 impl NodeState {
     /// Load persisted state from `<state_dir>/state.json` or start with the
-    /// genesis balance; a malformed file is reported as an error.
-    pub fn load(state_dir: &Path, default_mode: Mode, limits: Limits) -> Result<Self> {
+    /// genesis trust endowment; a malformed file is reported as an error.
+    pub fn load(
+        state_dir: &Path,
+        default_mode: Mode,
+        limits: Limits,
+        trust_cfg: &TrustCfg,
+    ) -> Result<Self> {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("cannot create state dir {}", state_dir.display()))?;
         let state_file = state_dir.join("state.json");
-        let (mode, credits, tasks_completed, tasks_failed) =
+        let (mode, trust, consumed, tasks_completed, tasks_failed) =
             match std::fs::read_to_string(&state_file) {
                 Ok(text) => {
                     let persisted: PersistedState = serde_json::from_str(&text)
-                        .with_context(|| {
-                            format!("invalid state file {}", state_file.display())
-                        })?;
+                        .with_context(|| format!("invalid state file {}", state_file.display()))?;
                     (
                         persisted.mode,
-                        persisted.credits,
+                        persisted.trust,
+                        persisted.consumed,
                         persisted.tasks_completed,
                         persisted.tasks_failed,
                     )
                 }
-                Err(_) => (default_mode, GENESIS_CREDITS, 0, 0),
+                Err(_) => (default_mode, trust_cfg.genesis_trust, 0, 0, 0),
             };
         Ok(Self {
             mode,
-            credits,
+            trust,
+            consumed,
+            points: compute_points(trust_cfg),
             msgs_sent: 0,
             msgs_received: 0,
             tasks_completed,
@@ -109,11 +121,13 @@ impl NodeState {
         })
     }
 
-    /// Persist balance, mode and task statistics atomically.
+    /// Persist mode, trust, consumption counter and task statistics
+    /// atomically so an interrupted write cannot corrupt the state.
     pub fn save(&self) -> Result<()> {
         let persisted = PersistedState {
             mode: self.mode,
-            credits: self.credits,
+            trust: self.trust,
+            consumed: self.consumed,
             tasks_completed: self.tasks_completed,
             tasks_failed: self.tasks_failed,
         };
@@ -127,5 +141,77 @@ impl NodeState {
     /// Time since the daemon started.
     pub fn uptime(&self) -> std::time::Duration {
         self.started.elapsed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::scratch_dir;
+
+    fn trust_cfg() -> TrustCfg {
+        TrustCfg {
+            genesis_trust: 42,
+            min_trust: 0,
+            points_per_core: 1,
+            points_per_gb: 1,
+        }
+    }
+
+    fn limits() -> Limits {
+        Limits {
+            cpu_percent: 50,
+            ram_mb: 1024,
+            max_tasks: 2,
+        }
+    }
+
+    #[test]
+    fn fresh_state_gets_genesis_trust_and_hardware_points() {
+        let dir = scratch_dir("state-fresh");
+        let state = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
+        assert_eq!(state.mode, Mode::Peer);
+        assert_eq!(state.trust, 42);
+        assert_eq!(state.consumed, 0);
+        assert_eq!(state.tasks_completed, 0);
+        assert_eq!(state.tasks_failed, 0);
+        assert!(state.points >= 1);
+    }
+
+    #[test]
+    fn save_and_reload_persist_all_fields() {
+        let dir = scratch_dir("state-roundtrip");
+        {
+            let mut state = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
+            state.mode = Mode::Seed;
+            state.trust = 7;
+            state.consumed = 13;
+            state.tasks_completed = 3;
+            state.tasks_failed = 1;
+            state.save().unwrap();
+        }
+        let state = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
+        assert_eq!(state.mode, Mode::Seed);
+        assert_eq!(state.trust, 7);
+        assert_eq!(state.consumed, 13);
+        assert_eq!(state.tasks_completed, 3);
+        assert_eq!(state.tasks_failed, 1);
+    }
+
+    #[test]
+    fn malformed_state_file_is_an_error() {
+        let dir = scratch_dir("state-bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("state.json"), "not json").unwrap();
+        assert!(NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).is_err());
+    }
+
+    #[test]
+    fn mode_names_roundtrip_and_garbage_is_rejected() {
+        for mode in [Mode::Peer, Mode::Seed, Mode::Leech] {
+            assert_eq!(Mode::parse(mode.as_str()).unwrap(), mode);
+        }
+        assert!(Mode::parse("PEER").is_err());
+        assert!(Mode::parse("").is_err());
     }
 }

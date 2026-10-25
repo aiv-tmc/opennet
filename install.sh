@@ -58,4 +58,4 @@ echo
 echo "opennetd is running. Useful commands:"
 echo "  opennetctl status     - node overview"
 echo "  opennetctl peers      - known peers"
-echo "  opennetctl compute - 5 'uname -a'   - try the compute market"
+echo "  opennetctl compute - 'uname -a'   - try the compute market"

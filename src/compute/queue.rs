@@ -1,4 +1,3 @@
-```rust
 //! Priority queue entry for pending task bids.
 
 use std::cmp::Ordering;
@@ -7,8 +6,11 @@ use std::cmp::Ordering;
 #[derive(PartialEq, Eq, Debug)]
 pub struct BidEntry {
     pub task_id: String,
+    pub from_node: String,
     pub from_addr: String,
     pub offer: u64,
+    /// Trust coefficient claimed by the consumer when the bid was queued.
+    pub trust: i64,
     pub expires_unix: u64,
     pub seq: u64,
 }
@@ -36,8 +38,10 @@ mod tests {
     fn bid(offer: u64, seq: u64) -> BidEntry {
         BidEntry {
             task_id: format!("t{seq}"),
+            from_node: "node".into(),
             from_addr: "1.2.3.4:9".into(),
             offer,
+            trust: 100,
             expires_unix: 9_999_999_999,
             seq,
         }

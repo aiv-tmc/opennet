@@ -1,10 +1,15 @@
 //! Compute market shared between providers (executors) and consumers.
 //!
-//! A consumer pays `offer` credits for one shell command executed on a
-//! provider. Providers schedule queued bids by offer size, highest first,
-//! and never run more than `limits.max_tasks` tasks at once.
+//! A consumer spends trust units for one shell command executed on a
+//! provider. Providers schedule queued bids by reservation size, highest
+//! first, and never run more than `limits.max_tasks` tasks at once. Both
+//! sides track the same trust coefficient: consuming lowers it, donating
+//! raises it, and providers refuse consumers whose effective trust would
+//! fall below the configured floor.
 
 pub mod client;
+pub mod executor;
+pub mod policy;
 pub mod provider;
 pub mod queue;
 
@@ -38,7 +43,7 @@ pub enum ComputeEvent {
 /// Forward one provider message to the consumer session waiting on `task_id`.
 ///
 /// Messages arriving after the consumer gave up have no waiter and are
-/// dropped; the consumer already refunded itself in that case.
+/// dropped; the consumer already released its reservation in that case.
 pub async fn deliver_event(ctx: &Arc<Ctx>, task_id: &str, event: ComputeEvent) {
     if let Some(sender) = ctx.result_waiters.lock().await.remove(task_id) {
         let _ = sender.send(event);
