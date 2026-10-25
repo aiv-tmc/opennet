@@ -1,0 +1,99 @@
+# Release workflow for OpenNet.
+#
+# Triggered by pushing a version tag (v*). Builds optimized stripped
+# binaries for the supported targets, packages them as tarballs with
+# SHA-256 checksums and publishes everything to the GitHub release page.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # One matrix leg per target. GNU targets build natively; the musl target
+  # additionally needs the musl C toolchain for the C dependencies of the
+  # Rust standard library; the ARM64 GNU target cross-compiles with the
+  # matching GCC cross toolchain.
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross_packages: ""
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross_packages: musl-tools
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross_packages: gcc-aarch64-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the stable toolchain for the target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install the cross-compilation C toolchain
+        if: ${{ matrix.cross_packages != '' }}
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cross_packages }}
+
+      - name: Cache compiled dependencies between runs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the release binaries for the target
+        run: cargo build --release --target ${{ matrix.target }} --verbose
+
+      - name: Strip and package the binaries
+        run: |
+          pkg=opennet-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir -p "$pkg/bin"
+          cp "target/${{ matrix.target }}/release/opennetd" "$pkg/bin/"
+          cp "target/${{ matrix.target }}/release/opennetctl" "$pkg/bin/"
+          cp install.sh "$pkg/"
+          cp -r init "$pkg/"
+          cp README.md "$pkg/"
+          chmod +x "$pkg/install.sh"
+          tar -czf "$pkg.tar.gz" "$pkg"
+          sha256sum "$pkg.tar.gz" > "$pkg.tar.gz.sha256"
+          echo "PACKAGE=$pkg.tar.gz" >> "$GITHUB_ENV"
+          echo "CHECKSUM=$pkg.tar.gz.sha256" >> "$GITHUB_ENV"
+
+      - name: Upload the package as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}
+          path: |
+            ${{ env.PACKAGE }}
+            ${{ env.CHECKSUM }}
+
+  # Collect every matrix artifact and attach them to the GitHub release that
+  # matches the pushed tag.
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all built packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the release with all packages and checksums
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
