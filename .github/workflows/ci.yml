@@ -97,6 +97,8 @@ jobs:
   # Boot the real daemon with a scratch configuration and drive it through
   # the control socket: status must report the genesis trust, shutdown must
   # stop the process cleanly and the state file must persist afterwards.
+  # The daemon output is captured to a log and printed on any failure so a
+  # crash before socket creation is diagnosable from the job log alone.
   smoke:
     name: Daemon smoke test
     needs: build
@@ -124,7 +126,8 @@ jobs:
 
       - name: Start the daemon in the background
         run: |
-          ./target/release/opennetd --config /tmp/opennet-smoke/config.toml &
+          ./target/release/opennetd --config /tmp/opennet-smoke/config.toml \
+            > /tmp/opennet-smoke/daemon.log 2>&1 &
           echo $! > /tmp/opennet-smoke/daemon.pid
 
       - name: Wait for the control socket to appear
@@ -135,11 +138,13 @@ jobs:
             fi
             if ! kill -0 "$(cat /tmp/opennet-smoke/daemon.pid)" 2>/dev/null; then
               echo "daemon exited before creating the control socket" >&2
+              cat /tmp/opennet-smoke/daemon.log >&2
               exit 1
             fi
             sleep 1
           done
           echo "control socket never appeared" >&2
+          cat /tmp/opennet-smoke/daemon.log >&2
           exit 1
 
       - name: Query the node status through the control socket
@@ -164,6 +169,7 @@ jobs:
             sleep 1
           done
           echo "daemon ignored the shutdown command" >&2
+          cat /tmp/opennet-smoke/daemon.log >&2
           exit 1
 
       - name: Verify the state file was persisted
