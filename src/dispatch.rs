@@ -170,7 +170,7 @@ mod tests {
         introduce(&consumer, &provider, 100, 2).await;
 
         let timeout = consumer.config.network.task_timeout_secs;
-        let units = 2 * ((timeout + 59) / 60).max(1) as i64;
+        let units = 2 * timeout.div_ceil(60).max(1) as i64;
         let prefix = &provider.identity.node_id()[..8];
         let out = compute::client::compute(
             &consumer,

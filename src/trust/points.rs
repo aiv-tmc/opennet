@@ -49,7 +49,7 @@ pub fn compute_points(cfg: &TrustCfg) -> u32 {
 /// value from the announced points and the configured default task timeout,
 /// so they always agree on the charge.
 pub fn units_for(points: u32, timeout_secs: u64) -> i64 {
-    let minutes = ((timeout_secs + 59) / 60).max(1) as i64;
+    let minutes = timeout_secs.div_ceil(60).max(1) as i64;
     points as i64 * minutes
 }
 
