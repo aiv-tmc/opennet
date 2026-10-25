@@ -117,7 +117,11 @@ mod tests {
         let payload = b"announcement payload";
         let signature = identity.sign(payload);
         assert!(Identity::verify(&identity.pubkey(), payload, &signature));
-        assert!(!Identity::verify(&identity.pubkey(), b"other payload", &signature));
+        assert!(!Identity::verify(
+            &identity.pubkey(),
+            b"other payload",
+            &signature
+        ));
         let foreign = Identity::load_or_create(&scratch_dir("id-foreign")).unwrap();
         assert!(!Identity::verify(&foreign.pubkey(), payload, &signature));
     }
