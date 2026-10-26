@@ -86,7 +86,7 @@ jobs:
         run: cargo build --release --verbose
 
       - name: Upload the binaries as a workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: opennet-binaries-${{ github.sha }}
           path: |
