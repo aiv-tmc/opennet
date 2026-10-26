@@ -200,8 +200,10 @@ mod tests {
     }
 
     fn launch(return_addr: &str, command: &str, timeout_secs: u64) -> Launch {
+        // A unique task id gives every test its own working directory, so
+        // parallel tests never remove each other's scratch directory.
         Launch {
-            task_id: "t-test".to_string(),
+            task_id: format!("t-test-{}", rand::random::<u32>()),
             return_addr: return_addr.to_string(),
             units: 5,
             command: command.to_string(),

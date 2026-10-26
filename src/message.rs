@@ -5,6 +5,9 @@
 //! verify the claimed identity, trust coefficient and consumption counter.
 //! Signatures travel as `Vec<u8>` because serde supports fixed arrays only
 //! up to 32 elements; verification converts them back to `[u8; 64]`.
+//! Messages and signing payloads are encoded with postcard, a small
+//! self-describing-free serde codec; the encoding is part of the wire
+//! format, so all nodes must run a matching version.
 //! Multicast discovery datagrams stay outside this protocol and unsigned.
 
 use crate::compute::TaskOutcome;
@@ -93,14 +96,15 @@ pub enum Message {
 }
 
 impl Message {
-    /// Serialize the message to bincode bytes; serialization of this enum is infallible.
+    /// Serialize the message to postcard bytes; serialization of this enum
+    /// is infallible for every representable value.
     pub fn encode(&self) -> Vec<u8> {
-        bincode::serialize(self).expect("message serialization failed")
+        postcard::to_allocvec(self).expect("message serialization failed")
     }
 
     /// Deserialize a message; returns `None` for malformed input.
     pub fn decode(data: &[u8]) -> Option<Self> {
-        bincode::deserialize(data).ok()
+        postcard::from_bytes(data).ok()
     }
 
     /// Build the exact byte sequence signed inside an `Ann` message.
@@ -111,7 +115,7 @@ impl Message {
         points: u32,
         unix_ts: u64,
     ) -> Vec<u8> {
-        bincode::serialize(&("ann", node_id, mode, trust, points, unix_ts))
+        postcard::to_allocvec(&("ann", node_id, mode, trust, points, unix_ts))
             .expect("payload serialization failed")
     }
 
@@ -122,7 +126,7 @@ impl Message {
         consumed: u64,
         expires_unix: u64,
     ) -> Vec<u8> {
-        bincode::serialize(&("bid", task_id, trust, consumed, expires_unix))
+        postcard::to_allocvec(&("bid", task_id, trust, consumed, expires_unix))
             .expect("payload serialization failed")
     }
 }
