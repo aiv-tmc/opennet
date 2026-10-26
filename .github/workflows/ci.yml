@@ -162,14 +162,14 @@ jobs:
           OPENNET_SOCKET: /tmp/opennet-smoke/control.sock
         run: |
           ./target/release/opennetctl shutdown
+          # PID-based liveness checks are unreliable here: the orphaned
+          # daemon turns into an unreaped zombie and its pid may be reused
+          # while kill -0 keeps succeeding. Probe the control socket
+          # instead: once the daemon exits, connecting to the stale socket
+          # file fails with ECONNREFUSED.
           for attempt in $(seq 1 15); do
-            pid=$(cat /tmp/opennet-smoke/daemon.pid)
-            # The daemon was orphaned when its starting step ended, so once
-            # it exits nothing reaps it: kill -0 still succeeds on a zombie.
-            if ! kill -0 "$pid" 2>/dev/null; then
-              exit 0
-            fi
-            if ps -o stat= -p "$pid" 2>/dev/null | grep -q '^Z'; then
+            if ! OPENNET_SOCKET=/tmp/opennet-smoke/control.sock \
+              ./target/release/opennetctl status >/dev/null 2>&1; then
               exit 0
             fi
             sleep 1
@@ -184,10 +184,17 @@ jobs:
   # Audit the dependency tree against the RustSec advisory database. The
   # lockfile is generated on the fly when it is not committed yet, so the
   # job works in both repository states; committing Cargo.lock pins the
-  # audited versions to the ones the release builds use.
+  # audited versions to the ones the release builds use. Publishing the
+  # result as a check run needs the checks:write permission, and pull
+  # requests from forks cannot receive check runs at all, so the job is
+  # skipped there.
   audit:
     name: Security audit
     needs: quality
+    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+    permissions:
+      checks: write
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repository
