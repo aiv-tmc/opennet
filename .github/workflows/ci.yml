@@ -163,7 +163,13 @@ jobs:
         run: |
           ./target/release/opennetctl shutdown
           for attempt in $(seq 1 15); do
-            if ! kill -0 "$(cat /tmp/opennet-smoke/daemon.pid)" 2>/dev/null; then
+            pid=$(cat /tmp/opennet-smoke/daemon.pid)
+            # The daemon was orphaned when its starting step ended, so once
+            # it exits nothing reaps it: kill -0 still succeeds on a zombie.
+            if ! kill -0 "$pid" 2>/dev/null; then
+              exit 0
+            fi
+            if ps -o stat= -p "$pid" 2>/dev/null | grep -q '^Z'; then
               exit 0
             fi
             sleep 1
@@ -175,8 +181,10 @@ jobs:
       - name: Verify the state file was persisted
         run: test -f /tmp/opennet-smoke/state/state.json
 
-  # Audit the dependency tree against the RustSec advisory database.
-  # Requires Cargo.lock to be committed, which this binary crate does.
+  # Audit the dependency tree against the RustSec advisory database. The
+  # lockfile is generated on the fly when it is not committed yet, so the
+  # job works in both repository states; committing Cargo.lock pins the
+  # audited versions to the ones the release builds use.
   audit:
     name: Security audit
     needs: quality
@@ -187,6 +195,9 @@ jobs:
 
       - name: Install the stable toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate the lockfile when it is not committed yet
+        run: cargo generate-lockfile
 
       - name: Run the advisory audit
         uses: rustsec/audit-check@v2
