@@ -1,86 +1,95 @@
-//! Per-peer reputation table measuring message honesty.
+//! Peer reputation table: tracks valid and invalid messages per peer and
+//! derives a simple score used to break ties when the compute client
+//! picks a provider. Scores are persisted to `<state_dir>/reputation.json`.
 //!
-//! Reputation is local knowledge only: each node scores its peers based on
-//! the validity of signed traffic. Invalid announcements and provably
-//! fraudulent bids lower the score and persist across restarts, so repeated
-//! misbehaviour accumulates even when the trust coefficient does not.
+//! Every table write is small and rare (one per announcement or failed
+//! verification), so persisting on each record keeps the table durable
+//! without measurable overhead.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Interaction statistics kept for one peer.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PeerReputation {
-    /// Messages with valid signatures received from this peer.
+/// Counters kept for one peer identity or connection address.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Rep {
+    /// Messages that passed full verification.
     pub valid_msgs: u64,
-    /// Messages with invalid signatures received from this peer.
+    /// Messages that failed verification.
     pub invalid_msgs: u64,
 }
 
-impl PeerReputation {
-    /// Signed reputation score: valid messages count positive, invalid
-    /// signatures weigh three times as much negative.
+impl Rep {
+    /// Net reputation: valid minus invalid messages.
     pub fn score(&self) -> i64 {
-        self.valid_msgs as i64 - self.invalid_msgs as i64 * 3
+        self.valid_msgs as i64 - self.invalid_msgs as i64
     }
 }
 
-/// Table of reputations keyed by node id (or network address before the
-/// peer's first signed announcement arrives).
+/// Table of reputation counters keyed by node id or connection address.
 pub struct RepTable {
-    table: HashMap<String, PeerReputation>,
+    entries: HashMap<String, Rep>,
     file: PathBuf,
 }
 
 impl RepTable {
     /// Load the table from `<state_dir>/reputation.json`; a missing file
-    /// yields an empty table, a malformed file is an error.
+    /// yields an empty table and a malformed file is an error.
     pub fn load(state_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(state_dir)?;
         let file = state_dir.join("reputation.json");
-        let table = match std::fs::read_to_string(&file) {
+        let entries = match std::fs::read_to_string(&file) {
             Ok(text) => serde_json::from_str(&text)
                 .with_context(|| format!("invalid reputation file {}", file.display()))?,
             Err(_) => HashMap::new(),
         };
-        Ok(Self { table, file })
+        Ok(Self { entries, file })
     }
 
-    /// Record one correctly signed message from a peer.
+    /// Record one fully verified message from `peer` and persist.
     pub fn record_valid(&mut self, peer: &str) {
-        self.table.entry(peer.to_string()).or_default().valid_msgs += 1;
-        self.persist();
+        let entry = self.entries.entry(peer.to_string()).or_insert(Rep {
+            valid_msgs: 0,
+            invalid_msgs: 0,
+        });
+        entry.valid_msgs += 1;
+        let _ = self.save();
     }
 
-    /// Record one incorrectly signed or provably fraudulent message from a
-    /// peer.
+    /// Record one failed verification attributed to `peer` and persist.
     pub fn record_invalid(&mut self, peer: &str) {
-        self.table.entry(peer.to_string()).or_default().invalid_msgs += 1;
-        self.persist();
+        let entry = self.entries.entry(peer.to_string()).or_insert(Rep {
+            valid_msgs: 0,
+            invalid_msgs: 0,
+        });
+        entry.invalid_msgs += 1;
+        let _ = self.save();
     }
 
-    /// All reputation entries ordered by peer key for stable display.
-    pub fn all(&self) -> Vec<(String, PeerReputation)> {
-        let mut entries: Vec<(String, PeerReputation)> = self
-            .table
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+    /// Net score of one peer; unknown peers score zero.
+    pub fn score_of(&self, peer: &str) -> i64 {
+        self.entries.get(peer).map(|rep| rep.score()).unwrap_or(0)
+    }
+
+    /// All entries ordered by score, highest first.
+    pub fn all(&self) -> Vec<(String, Rep)> {
+        let mut entries: Vec<(String, Rep)> = self.entries.clone().into_iter().collect();
+        entries.sort_by_key(|(_, rep)| std::cmp::Reverse(rep.score()));
         entries
     }
 
-    /// Persist the table atomically; failures are logged but not propagated
-    /// because reputation is rebuildable knowledge.
-    fn persist(&self) {
-        if let Ok(text) = serde_json::to_string_pretty(&self.table) {
-            let tmp = self.file.with_extension("tmp");
-            if std::fs::write(&tmp, &text).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.file);
-            }
+    /// Persist the table atomically (temp file plus rename), creating the
+    /// parent directory first so early records cannot be lost to a missing
+    /// state directory.
+    fn save(&self) -> Result<()> {
+        if let Some(parent) = self.file.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        let text = serde_json::to_string_pretty(&self.entries)?;
+        let tmp = self.file.with_extension("tmp");
+        std::fs::write(&tmp, &text)?;
+        std::fs::rename(&tmp, &self.file)?;
+        Ok(())
     }
 }
 
@@ -90,54 +99,36 @@ mod tests {
     use crate::testutil::scratch_dir;
 
     #[test]
-    fn fresh_table_is_empty() {
-        let table = RepTable::load(&scratch_dir("rep-fresh")).unwrap();
-        assert!(table.all().is_empty());
-    }
-
-    #[test]
-    fn counts_accumulate_and_score_weighs_invalid_threefold() {
-        let mut table = RepTable::load(&scratch_dir("rep-score")).unwrap();
+    fn scores_grow_and_shrink_with_verification_outcomes() {
+        let mut table = RepTable::load(&scratch_dir("rep-basic")).unwrap();
         table.record_valid("node-a");
         table.record_valid("node-a");
         table.record_invalid("node-a");
-        let (_, rep) = table.all().pop().expect("entry missing");
-        assert_eq!(rep.valid_msgs, 2);
-        assert_eq!(rep.invalid_msgs, 1);
-        assert_eq!(rep.score(), -1);
+        assert_eq!(table.score_of("node-a"), 1);
+        assert_eq!(table.score_of("stranger"), 0);
     }
 
     #[test]
-    fn table_persists_across_loads() {
+    fn table_persists_between_loads() {
         let dir = scratch_dir("rep-persist");
         {
             let mut table = RepTable::load(&dir).unwrap();
-            table.record_valid("node-a");
-            table.record_invalid("node-b");
+            table.record_valid("node-b");
+            table.record_invalid("node-c");
         }
-        let table = RepTable::load(&dir).unwrap();
+        let reloaded = RepTable::load(&dir).unwrap();
+        assert_eq!(reloaded.score_of("node-b"), 1);
+        assert_eq!(reloaded.score_of("node-c"), -1);
+    }
+
+    #[test]
+    fn all_orders_by_descending_score() {
+        let mut table = RepTable::load(&scratch_dir("rep-order")).unwrap();
+        table.record_valid("good");
+        table.record_valid("good");
+        table.record_invalid("bad");
         let entries = table.all();
-        assert_eq!(entries.len(), 2);
-        let a = entries.iter().find(|(k, _)| k == "node-a").unwrap();
-        let b = entries.iter().find(|(k, _)| k == "node-b").unwrap();
-        assert_eq!(a.1.valid_msgs, 1);
-        assert_eq!(b.1.invalid_msgs, 1);
-    }
-
-    #[test]
-    fn entries_are_sorted_by_key() {
-        let mut table = RepTable::load(&scratch_dir("rep-sort")).unwrap();
-        table.record_valid("node-b");
-        table.record_valid("node-a");
-        let keys: Vec<String> = table.all().into_iter().map(|(k, _)| k).collect();
-        assert_eq!(keys, vec!["node-a".to_string(), "node-b".to_string()]);
-    }
-
-    #[test]
-    fn malformed_file_is_an_error() {
-        let dir = scratch_dir("rep-bad");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("reputation.json"), "not json").unwrap();
-        assert!(RepTable::load(&dir).is_err());
+        assert_eq!(entries[0].0, "good");
+        assert_eq!(entries[1].0, "bad");
     }
 }

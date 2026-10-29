@@ -1,29 +1,47 @@
-//! Entry point of the OpenNet daemon binary.
+//! Daemon binary: parses arguments, loads configuration and runs the
+//! daemon event loop until the control interface requests shutdown.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::path::PathBuf;
+use tokio::sync::watch;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let mut config_path: Option<PathBuf> = None;
+    let mut socket_override: Option<PathBuf> = None;
+    let mut print_default_config = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--print-default-config" => print_default_config = true,
             "--config" => {
-                let value = args.next().expect("--config requires a path argument");
-                config_path = Some(PathBuf::from(value));
+                let path = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--config requires a file path"))?;
+                config_path = Some(PathBuf::from(path));
             }
-            "--print-default-config" => {
-                print!("{}", opennet::config::default_toml()?);
-                return Ok(());
+            "--socket" => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--socket requires a file path"))?;
+                socket_override = Some(PathBuf::from(path));
             }
-            "--help" | "-h" => {
-                println!("Usage: opennetd [--config <path>] [--print-default-config]");
-                return Ok(());
+            other if other.starts_with("--config=") => {
+                config_path = Some(PathBuf::from(other.trim_start_matches("--config=")));
             }
-            other => anyhow::bail!("unknown argument: {other} (try --help)"),
+            other if other.starts_with("--socket=") => {
+                socket_override = Some(PathBuf::from(other.trim_start_matches("--socket=")));
+            }
+            other => bail!("unknown argument {other}"),
         }
     }
-    let config = opennet::config::load(config_path)?;
-    opennet::daemon::run(config).await
+    let mut config = opennet::config::load(config_path)?;
+    if let Some(socket) = socket_override {
+        config.paths.socket_path = socket;
+    }
+    if print_default_config {
+        print!("{}", opennet::config::default_toml()?);
+        return Ok(());
+    }
+    let (shutdown, _rx) = watch::channel(false);
+    opennet::daemon::run(config, shutdown)
 }

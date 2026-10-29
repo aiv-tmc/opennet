@@ -1,22 +1,31 @@
-# systemd unit for the OpenNet daemon.
-# Install:  cp init/opennetd.service /etc/systemd/system/ && systemctl daemon-reload
+# OpenNet daemon unit for systemd.
+# Runs as the unprivileged `opennet` system user (created via
+# opennet.sysusers), with a delegated cgroup subtree for per-task resource
+# limits and a hardened sandbox.
 [Unit]
-Description=OpenNet distributed computing daemon
-Documentation=https://github.com/aiv-tmc/OpenNet
+Description=OpenNet P2P compute daemon
+Documentation=https://github.com/aiv-tmc/opennet
 After=network.target
 
 [Service]
 Type=notify
-# StateDirectory creates /var/lib/opennet, RuntimeDirectory creates /run/opennet.
-StateDirectory=opennet
-RuntimeDirectory=opennet
+NotifyAccess=main
 ExecStart=/usr/local/bin/opennetd
+User=opennet
+Group=opennet
 Restart=on-failure
 RestartSec=2
+# Delegate a cgroup subtree so the daemon can create per-task cgroups.
+Delegate=yes
+
+# Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+StateDirectory=opennet
+RuntimeDirectory=opennet
+ReadWritePaths=/var/lib/opennet /run/opennet /sys/fs/cgroup
 
 [Install]
 WantedBy=multi-user.target

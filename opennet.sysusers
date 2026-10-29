@@ -1,0 +1,2 @@
+# OpenNet daemon system user.
+u opennet - "OpenNet P2P compute daemon" /var/lib/opennet

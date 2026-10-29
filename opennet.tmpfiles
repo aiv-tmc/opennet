@@ -1,0 +1,4 @@
+# OpenNet runtime and state directories (created on first boot).
+d /var/lib/opennet        0750 opennet opennet
+d /var/lib/opennet/swarm  0750 opennet opennet
+d /run/opennet            0750 opennet opennet

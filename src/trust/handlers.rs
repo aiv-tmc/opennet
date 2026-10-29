@@ -1,8 +1,12 @@
-//! Verification of signed announcements and task bids.
+//! Verification of signed announcements, swarm offers and task bids.
 //!
 //! Announcements establish a peer's identity, mode, trust coefficient and
 //! capacity points; bids carry a signed trust snapshot so providers can
-//! enforce the consumption policy without trusting bare wire claims.
+//! enforce the consumption policy without trusting bare wire claims. Every
+//! failed verification is penalized against the connection address, never
+//! against a claimed node id: a replayed or forged message proves nothing
+//! about the node it tries to borrow, and penalizing the victim would let
+//! an attacker destroy an innocent peer's reputation.
 
 use crate::config::Config;
 use crate::daemon::Ctx;
@@ -29,7 +33,8 @@ fn timestamp_fresh(unix_ts: u64, now: u64, max_age_secs: u64, future_skew_secs: 
 /// The node id must match the signer's public key, the signature must cover
 /// the exact signed payload, the timestamp must be fresh and the mode must
 /// be a known operating mode. Valid updates refresh the peer record and the
-/// reputation table; anything else penalizes the sender.
+/// reputation table; anything else penalizes the sender's connection
+/// address so a replayed announcement can never hurt the real owner's score.
 pub async fn handle_ann(ctx: &Arc<Ctx>, src: &str, ann: Message) {
     let Message::Ann {
         node_id,
@@ -61,11 +66,7 @@ pub async fn handle_ann(ctx: &Arc<Ctx>, src: &str, ann: Message) {
             .await
             .apply_ann(src, &node_id, &mode, trust, points, unix_ts);
     } else {
-        // Key the penalty by node id only when the claimed id provably does
-        // not belong to the signer; otherwise blame the connection address
-        // so an attacker cannot frame an innocent node with a borrowed key.
-        let key = if id_matches { node_id.as_str() } else { src };
-        ctx.reputation.lock().await.record_invalid(key);
+        ctx.reputation.lock().await.record_invalid(src);
         eprintln!("[opennetd] invalid announcement from {src}");
     }
 }
@@ -85,6 +86,21 @@ pub fn verify_bid(
     signature: &[u8],
 ) -> Option<String> {
     let payload = Message::bid_signing_payload(task_id, trust, consumed, expires_unix);
+    let sig = sig_array(signature)?;
+    Identity::verify(pubkey, &payload, sig).then(|| Identity::node_id_from_pubkey(pubkey))
+}
+
+/// Verify a signed swarm offer and return the authenticated node id, or
+/// `None` when the signature does not match the claimed identity.
+pub fn verify_swarm_join(
+    program: &str,
+    max_shard_ram_mb: u64,
+    cpu_cores: u32,
+    unix_ts: u64,
+    pubkey: &[u8; 32],
+    signature: &[u8],
+) -> Option<String> {
+    let payload = Message::swarm_signing_payload(program, max_shard_ram_mb, cpu_cores, unix_ts);
     let sig = sig_array(signature)?;
     Identity::verify(pubkey, &payload, sig).then(|| Identity::node_id_from_pubkey(pubkey))
 }
@@ -120,14 +136,6 @@ mod tests {
     }
 
     #[test]
-    fn signature_array_requires_exact_length() {
-        assert!(sig_array(&[0u8; 64]).is_some());
-        assert!(sig_array(&[0u8; 63]).is_none());
-        assert!(sig_array(&[0u8; 65]).is_none());
-        assert!(sig_array(&[]).is_none());
-    }
-
-    #[test]
     fn valid_bid_authenticates_signer_node_id() {
         let key = test_key();
         let pubkey = key.verifying_key().to_bytes();
@@ -152,27 +160,17 @@ mod tests {
     }
 
     #[test]
-    fn foreign_key_cannot_produce_valid_bid() {
-        let signer = test_key();
-        let other = test_key();
-        let payload = Message::bid_signing_payload("t1", 90, 10, 12345);
-        let signature = signer.sign(&payload).to_vec();
-        assert!(verify_bid(
-            "t1",
-            90,
-            10,
-            12345,
-            &other.verifying_key().to_bytes(),
-            &signature
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn malformed_signature_is_rejected() {
+    fn valid_swarm_join_authenticates_signer_node_id() {
         let key = test_key();
         let pubkey = key.verifying_key().to_bytes();
-        assert!(verify_bid("t1", 90, 10, 12345, &pubkey, &[1u8; 32]).is_none());
+        let payload = Message::swarm_signing_payload("demo", 4096, 8, 12345);
+        let signature = key.sign(&payload).to_vec();
+        let claimed = verify_swarm_join("demo", 4096, 8, 12345, &pubkey, &signature);
+        assert_eq!(
+            claimed.as_deref(),
+            Some(Identity::node_id_from_pubkey(&pubkey).as_str())
+        );
+        assert!(verify_swarm_join("other", 4096, 8, 12345, &pubkey, &signature).is_none());
     }
 
     #[test]

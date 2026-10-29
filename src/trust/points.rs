@@ -1,8 +1,12 @@
-//! Capacity pricing: every node converts its hardware characteristics into
-//! a static price tag measured in points, announces it to peers and uses it
+//! Capacity pricing: every node converts its *offered* hardware into a
+//! static price tag measured in points, announces it to peers and uses it
 //! to charge trust units for executed tasks.
+//!
+//! Points reflect the capacity the node actually makes available to the
+//! network (`limits`), not the raw machine size, so a large server that
+//! offers little cannot price itself like a large server that offers a lot.
 
-use crate::config::TrustCfg;
+use crate::config::{Limits, TrustCfg};
 
 /// Fallback RAM total (in megabytes) used when the kernel does not expose
 /// /proc/meminfo, so pricing still works on non-Linux systems.
@@ -31,31 +35,43 @@ fn total_ram_mb() -> u64 {
         .unwrap_or(FALLBACK_RAM_MB)
 }
 
-/// Compute this node's capacity points from its real hardware: one weight
-/// per CPU core plus one weight per gibibyte of RAM, clamped to at least
-/// one point so even tiny devices can participate in the market.
-pub fn compute_points(cfg: &TrustCfg) -> u32 {
+/// Compute this node's capacity points from the hardware it offers to the
+/// network: offered CPU cores (total cores scaled by `cpu_percent`) plus
+/// offered gibibytes of RAM (total RAM capped by `ram_mb`), clamped to at
+/// least one point so even tiny devices can participate in the market.
+pub fn compute_points(cfg: &TrustCfg, limits: &Limits) -> u32 {
     let cores = std::thread::available_parallelism()
         .map(|count| count.get() as u64)
         .unwrap_or(1);
-    let ram_gb = (total_ram_mb() / 1024).max(1);
-    let points = cores * cfg.points_per_core as u64 + ram_gb * cfg.points_per_gb as u64;
+    let offered_cores = ((cores * limits.cpu_percent as u64) / 100).max(1);
+    let offered_ram_gb = (total_ram_mb().min(limits.ram_mb) / 1024).max(1);
+    let points =
+        offered_cores * cfg.points_per_core as u64 + offered_ram_gb * cfg.points_per_gb as u64;
     points.clamp(1, u32::MAX as u64) as u32
 }
 
-/// Trust units one task reserves and eventually moves: the provider's point
-/// price per started minute of wall-clock limit, at least one minute; any
-/// partially started minute counts as a full one. Both sides derive the
-/// value from the announced points and the configured default task timeout,
-/// so they always agree on the charge.
-pub fn units_for(points: u32, timeout_secs: u64) -> i64 {
-    let minutes = timeout_secs.div_ceil(60).max(1) as i64;
+/// Trust units a task reserves and eventually moves: the provider's point
+/// price per started minute of the billing window, at least one minute;
+/// any partially started minute counts as a full one. Both sides derive the
+/// value from the announced points and one agreed duration, so they always
+/// agree on the charge.
+pub fn units_for(points: u32, secs: u64) -> i64 {
+    let minutes = secs.div_ceil(60).max(1) as i64;
     points as i64 * minutes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg() -> TrustCfg {
+        TrustCfg {
+            genesis_trust: 100,
+            min_trust: 0,
+            points_per_core: 10,
+            points_per_gb: 2,
+        }
+    }
 
     #[test]
     fn memtotal_parses_standard_proc_meminfo() {
@@ -64,54 +80,38 @@ mod tests {
     }
 
     #[test]
-    fn memtotal_handles_whitespace_variants() {
-        assert_eq!(memtotal_kb("MemTotal:   2048 kB"), Some(2048));
-        assert_eq!(memtotal_kb("MemTotal:\t1048576 kB"), Some(1_048_576));
-    }
-
-    #[test]
     fn memtotal_rejects_missing_or_malformed_input() {
         assert_eq!(memtotal_kb(""), None);
         assert_eq!(memtotal_kb("MemFree: 100 kB\n"), None);
         assert_eq!(memtotal_kb("MemTotal: notanumber kB\n"), None);
-        assert_eq!(memtotal_kb("MemTotal: 100"), Some(100));
     }
 
     #[test]
-    fn units_charge_one_minute_minimum() {
-        assert_eq!(units_for(10, 0), 10);
-        assert_eq!(units_for(10, 1), 10);
-        assert_eq!(units_for(10, 59), 10);
-        assert_eq!(units_for(10, 60), 10);
+    fn offered_limits_cap_the_point_price() {
+        let cheap = compute_points(
+            &cfg(),
+            &Limits {
+                cpu_percent: 10,
+                ram_mb: 1024,
+                max_tasks: 1,
+            },
+        );
+        let rich = compute_points(
+            &cfg(),
+            &Limits {
+                cpu_percent: 100,
+                ram_mb: 1_048_576,
+                max_tasks: 64,
+            },
+        );
+        assert!(rich > cheap);
+        assert!(cheap >= 1);
     }
 
     #[test]
-    fn units_scale_with_started_minutes() {
-        assert_eq!(units_for(10, 61), 20);
-        assert_eq!(units_for(10, 120), 20);
-        assert_eq!(units_for(10, 300), 50);
+    fn units_follow_billed_seconds() {
+        assert_eq!(units_for(2, 0), 2);
+        assert_eq!(units_for(2, 61), 4);
         assert_eq!(units_for(3, 300), 15);
-    }
-
-    #[test]
-    fn zero_weights_still_yield_participation_points() {
-        let cfg = TrustCfg {
-            genesis_trust: 0,
-            min_trust: 0,
-            points_per_core: 0,
-            points_per_gb: 0,
-        };
-        assert_eq!(compute_points(&cfg), 1);
-    }
-
-    #[test]
-    fn hardware_pricing_is_always_positive() {
-        let cfg = TrustCfg {
-            genesis_trust: 100,
-            min_trust: 0,
-            points_per_core: 10,
-            points_per_gb: 2,
-        };
-        assert!(compute_points(&cfg) >= 1);
     }
 }

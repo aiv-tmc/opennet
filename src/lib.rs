@@ -4,8 +4,10 @@
 //! persistent per-peer connections, LAN multicast discovery, the signed wire
 //! protocol, the peer routing table, node identity and runtime trust state,
 //! capacity pricing in hardware points, the compute market driven by the
-//! trust coefficient, the peer reputation table and the daemon event loop
-//! used by the `opennetd` binary.
+//! trust coefficient, the opt-in swarm mode for hosting shards of one
+//! shared program across the LAN, the peer reputation table, the execution
+//! sandbox for tasks and shard runners and the daemon event loop used by
+//! the `opennetd` binary.
 
 pub mod compute;
 pub mod config;
@@ -19,6 +21,8 @@ pub mod init;
 pub mod message;
 pub mod node;
 pub mod reputation;
+pub mod sandbox;
+pub mod swarm;
 pub mod transport;
 pub mod trust;
 

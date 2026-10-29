@@ -1,38 +1,55 @@
-//! Provider-side executor: runs accepted commands safely and reports
-//! completion so the scheduler frees the slot.
+//! Provider-side executor: runs accepted commands inside the execution
+//! sandbox and reports completion so the scheduler frees the slot.
 //!
-//! Safety properties: every task runs in a fresh temporary directory with
-//! a scrubbed environment (PATH and HOME only), inside its own process
-//! group that is killed wholesale on timeout, and both output streams are
-//! read with a hard cap so a flooding task cannot exhaust daemon memory.
+//! Safety properties: every task runs in a fresh temporary directory with a
+//! scrubbed environment (PATH and HOME only), inside its own process group
+//! that is killed wholesale on timeout, with namespace isolation and cgroup
+//! resource limits applied when the platform allows it. Both output streams
+//! are read with a hard cap so a flooding task cannot exhaust daemon memory.
+//! Output reader tasks are awaited under a drain deadline after the child
+//! dies and only aborted when they miss it, so captured output survives the
+//! normal path while a detached grandchild holding a pipe open can still
+//! never wedge an executor slot forever.
+//!
+//! Billing: the trust credit equals `units_for(points, billed_secs)` —
+//! exactly what the consumer charges itself from the same `billed_secs`
+//! carried in the outcome, so the economy stays conserved. The reservation
+//! size carried in `Launch.units` serves only the scheduler's in-flight
+//! accounting.
 
-use crate::compute::provider::{Cmd, Launch};
-use crate::compute::TaskOutcome;
+use crate::compute::provider::Cmd;
+use crate::compute::{Launch, TaskOutcome};
 use crate::daemon::{send_msg, Ctx};
 use crate::message::Message;
+use crate::sandbox;
+use crate::trust::points::units_for;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
 /// Maximum captured output per stream, in bytes.
 const OUTPUT_CAP: usize = 64 * 1024;
+/// Deadline for collecting output after the child has died; readers that
+/// miss it are aborted so a stuck pipe cannot hold the slot.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Execution environment handed to every task process.
 const TASK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// Executor loop: runs launched commands and reports `Cmd::Freed` after
-/// each so the scheduler can refill the freed slot from the bid queue.
+/// each so the scheduler can refill the freed slot from the pending heap.
 pub async fn run(ctx: Arc<Ctx>, mut rx: mpsc::Receiver<Launch>) {
     while let Some(launch) = rx.recv().await {
+        let task_id = launch.task_id.clone();
         execute(&ctx, launch).await;
-        let _ = ctx.compute.send(Cmd::Freed).await;
+        let _ = ctx.compute.send(Cmd::Freed { task_id }).await;
     }
 }
 
-/// Run one command in a fresh working directory with a scrubbed environment
-/// and a hard wall-clock limit, then credit the donated units, update
-/// statistics and report the outcome to the consumer.
+/// Run one command in a fresh working directory with a scrubbed
+/// environment, a hard wall-clock limit and the sandbox applied, then
+/// credit the billed units, update statistics and report the outcome.
 async fn execute(ctx: &Arc<Ctx>, launch: Launch) {
     let workdir = std::env::temp_dir().join(format!("opennet-task-{}", launch.task_id));
     let _ = tokio::fs::create_dir_all(&workdir).await;
@@ -41,8 +58,10 @@ async fn execute(ctx: &Arc<Ctx>, launch: Launch) {
     let timeout_secs = launch
         .timeout_secs
         .clamp(1, ctx.config.network.task_timeout_secs.max(1));
+    let started = Instant::now();
 
-    let mut child = match Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(&launch.command)
         .current_dir(&workdir)
@@ -54,9 +73,10 @@ async fn execute(ctx: &Arc<Ctx>, launch: Launch) {
         .stderr(std::process::Stdio::piped())
         // Give the task its own process group so the timeout path can kill
         // the whole tree, including grandchildren the shell may spawn.
-        .process_group(0)
-        .spawn()
-    {
+        .process_group(0);
+    sandbox::apply_to_command(&mut command, &workdir, &ctx.config.sandbox);
+
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
             finish(
@@ -67,12 +87,24 @@ async fn execute(ctx: &Arc<Ctx>, launch: Launch) {
                     exit_code: -1,
                     stdout: String::new(),
                     stderr: format!("failed to start task: {err}"),
+                    billed_secs: 1,
                 },
             )
             .await;
             return;
         }
     };
+    // Resource limits ride in the same cgroup for the whole process group;
+    // the guard outlives the child and cleans up on drop.
+    let _cgroup = child.id().and_then(|pid| {
+        sandbox::CgroupGuard::attach(
+            &launch.task_id,
+            pid,
+            &ctx.config.sandbox,
+            ctx.config.limits.ram_mb,
+            ctx.config.limits.cpu_percent,
+        )
+    });
     // The child was just spawned, so its id is always available; it is
     // captured before waiting because the timeout and reap-failure paths
     // must address the process group by it.
@@ -91,8 +123,6 @@ async fn execute(ctx: &Arc<Ctx>, launch: Launch) {
             // task, then reap it.
             unsafe { libc::killpg(pid, libc::SIGKILL) };
             let _ = child.wait().await;
-            out_handle.abort();
-            err_handle.abort();
             (-1, format!("failed to reap task: {err}"))
         }
         Err(_) => {
@@ -108,12 +138,17 @@ async fn execute(ctx: &Arc<Ctx>, launch: Launch) {
             )
         }
     };
-    let stdout = out_handle.await.unwrap_or_default();
+    // Readers finish on their own once the pipes close behind the dead
+    // child; only a reader still stuck past the deadline is aborted.
+    let stdout = collect_output(out_handle).await;
     let stderr = if stderr.is_empty() {
-        to_text(err_handle.await.unwrap_or_default())
+        to_text(collect_output(err_handle).await)
     } else {
         stderr
     };
+    // Bill the real wall-clock time, at least one second and never more
+    // than the enforced limit; both sides price the task from this value.
+    let billed_secs = started.elapsed().as_secs().clamp(1, timeout_secs);
     finish(
         ctx,
         &launch,
@@ -122,13 +157,29 @@ async fn execute(ctx: &Arc<Ctx>, launch: Launch) {
             exit_code,
             stdout: to_text(stdout),
             stderr,
+            billed_secs,
         },
     )
     .await;
 }
 
-/// Update statistics, credit the donated units to the local trust
-/// coefficient, persist the state and deliver the outcome to the consumer.
+/// Await one reader task under the drain deadline, aborting it only when
+/// it does not finish in time; its captured bytes are returned on success.
+async fn collect_output(mut handle: tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    match tokio::time::timeout(DRAIN_TIMEOUT, &mut handle).await {
+        Ok(Ok(bytes)) => bytes,
+        _ => {
+            handle.abort();
+            Vec::new()
+        }
+    }
+}
+
+/// Credit the billed units to the local trust coefficient, update task
+/// statistics, persist the state and deliver the outcome to the consumer.
+///
+/// The credit is derived from the same `billed_secs` the consumer charges
+/// itself, keeping the total trust across the network conserved.
 async fn finish(ctx: &Arc<Ctx>, launch: &Launch, workdir: &std::path::Path, outcome: TaskOutcome) {
     let _ = tokio::fs::remove_dir_all(workdir).await;
     {
@@ -138,8 +189,10 @@ async fn finish(ctx: &Arc<Ctx>, launch: &Launch, workdir: &std::path::Path, outc
         } else {
             state.tasks_failed += 1;
         }
-        // Donating compute to the network raises the trust coefficient.
-        state.trust += launch.units;
+        // Donating compute to the network raises the trust coefficient by
+        // exactly what the consumer paid for this task.
+        let units = units_for(state.points, outcome.billed_secs);
+        state.trust += units;
         let _ = state.save();
     }
     let _ = send_msg(
@@ -184,110 +237,4 @@ fn to_text(bytes: Vec<u8>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::message::Message;
-    use crate::testutil::make_ctx;
-    use crate::transport::Transport;
-    use tokio::io::AsyncWriteExt;
-
-    /// Build an executor context plus a standalone transport acting as the
-    /// consumer side that receives the task outcome.
-    async fn setup(tag: &str) -> (Arc<Ctx>, Transport) {
-        let (ctx, _rx) = make_ctx(tag).await;
-        let consumer_side = Transport::new(0).await.unwrap();
-        (ctx, consumer_side)
-    }
-
-    fn launch(return_addr: &str, command: &str, timeout_secs: u64) -> Launch {
-        // A unique task id gives every test its own working directory, so
-        // parallel tests never remove each other's scratch directory.
-        Launch {
-            task_id: format!("t-test-{}", rand::random::<u32>()),
-            return_addr: return_addr.to_string(),
-            units: 5,
-            command: command.to_string(),
-            timeout_secs,
-        }
-    }
-
-    async fn recv_outcome(consumer_side: &Transport) -> TaskOutcome {
-        let (_src, data) = tokio::time::timeout(Duration::from_secs(10), consumer_side.recv())
-            .await
-            .expect("timed out waiting for TaskResult")
-            .expect("transport closed");
-        match Message::decode(&data) {
-            Some(Message::TaskResult { outcome, .. }) => outcome,
-            other => panic!("expected TaskResult, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn successful_task_credits_trust_and_reports_output() {
-        let (ctx, consumer_side) = setup("ex-ok").await;
-        execute(
-            &ctx,
-            launch(&consumer_side.local_id(), "echo hello-opennet", 30),
-        )
-        .await;
-        assert_eq!(ctx.state.lock().await.trust, 105);
-        assert_eq!(ctx.state.lock().await.tasks_completed, 1);
-        let outcome = recv_outcome(&consumer_side).await;
-        assert_eq!(outcome.exit_code, 0);
-        assert!(
-            outcome.stdout.contains("hello-opennet"),
-            "unexpected stdout: {}",
-            outcome.stdout
-        );
-    }
-
-    #[tokio::test]
-    async fn failing_task_counts_failure_and_captures_stderr() {
-        let (ctx, consumer_side) = setup("ex-fail").await;
-        execute(
-            &ctx,
-            launch(&consumer_side.local_id(), "echo oops >&2; exit 3", 30),
-        )
-        .await;
-        assert_eq!(ctx.state.lock().await.tasks_failed, 1);
-        let outcome = recv_outcome(&consumer_side).await;
-        assert_eq!(outcome.exit_code, 3);
-        assert!(outcome.stderr.contains("oops"), "unexpected stderr");
-    }
-
-    #[tokio::test]
-    async fn timeout_kills_the_task_and_marks_it() {
-        let (ctx, consumer_side) = setup("ex-timeout").await;
-        let start = std::time::Instant::now();
-        execute(&ctx, launch(&consumer_side.local_id(), "sleep 30", 1)).await;
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "timeout path took too long"
-        );
-        let outcome = recv_outcome(&consumer_side).await;
-        assert_eq!(outcome.exit_code, -2);
-        assert!(outcome.stderr.contains("exceeded"), "unexpected stderr");
-    }
-
-    #[tokio::test]
-    async fn capped_reader_bounds_memory_and_drains_the_rest() {
-        let (mut mock, mut writer) = tokio::io::duplex(4096);
-        let write = tokio::spawn(async move {
-            for _ in 0..32 {
-                writer.write_all(&[7u8; 4096]).await.unwrap();
-            }
-        });
-        let data = read_capped(&mut mock).await;
-        write.await.unwrap();
-        assert_eq!(data.len(), OUTPUT_CAP);
-        assert!(data.iter().all(|byte| *byte == 7));
-    }
-
-    #[tokio::test]
-    async fn to_text_marks_truncated_content() {
-        let big = vec![b'x'; OUTPUT_CAP];
-        let text = to_text(big);
-        assert!(text.ends_with("...[truncated]"));
-        assert_eq!(to_text(b"abc".to_vec()), "abc");
-    }
-}
+mod tests;

@@ -1,7 +1,5 @@
 #!/bin/sh
-# runit service file for the OpenNet daemon.
-# Install:  mkdir -p /etc/sv/opennetd && cp init/opennetd.run /etc/sv/opennetd/run
-#           ln -s /etc/sv/opennetd /var/service/
+# OpenNet daemon service for runit: run the daemon in the foreground and
+# let runit supervise it.
 exec 2>&1
-mkdir -p /var/lib/opennet /run/opennet
 exec /usr/local/bin/opennetd

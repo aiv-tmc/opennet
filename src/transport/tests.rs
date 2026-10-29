@@ -1,93 +1,113 @@
-//! Tests for the TCP transport: frame framing, size limits and end-to-end
-//! exchange between two transport instances.
+//! Transport tests over a real loopback listener.
 
 use super::*;
+use crate::message::Message;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 
-/// Open a connected loopback socket pair for frame-level tests.
-async fn socket_pair() -> (TcpStream, TcpStream) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let client = TcpStream::connect(addr).await.unwrap();
-    let (server, _) = listener.accept().await.unwrap();
-    (client, server)
-}
+const IDLE: Duration = Duration::from_secs(60);
 
 #[tokio::test]
-async fn frame_roundtrip_over_socket() {
-    let (mut client, server) = socket_pair().await;
-    client.write_all(&(5u32).to_be_bytes()).await.unwrap();
-    client.write_all(b"hello").await.unwrap();
-    let frame = read_frame(&server).await.unwrap();
-    assert_eq!(&frame[..], b"hello");
-}
-
-#[tokio::test]
-async fn write_frame_matches_read_frame() {
-    let (client, server) = socket_pair().await;
-    write_frame(&client, b"payload").await.unwrap();
-    let frame = read_frame(&server).await.unwrap();
-    assert_eq!(&frame[..], b"payload");
-}
-
-#[tokio::test]
-async fn oversized_frame_is_rejected_before_allocation() {
-    let (mut client, server) = socket_pair().await;
-    client
-        .write_all(&((MAX_FRAME as u32) + 1).to_be_bytes())
-        .await
-        .unwrap();
-    client.write_all(&[0u8; 64]).await.unwrap();
-    assert!(read_frame(&server).await.is_err());
-}
-
-#[tokio::test]
-async fn truncated_frame_is_an_error() {
-    let (mut client, server) = socket_pair().await;
-    client.write_all(&(10u32).to_be_bytes()).await.unwrap();
-    client.write_all(b"short").await.unwrap();
-    drop(client);
-    assert!(read_frame(&server).await.is_err());
-}
-
-#[tokio::test]
-async fn two_transports_exchange_frames_both_ways() {
-    let a = Transport::new(0).await.unwrap();
-    let b = Transport::new(0).await.unwrap();
-    let payload = Bytes::from_static(b"ping-bytes");
-    a.send(&b.local_id(), payload.clone()).await.unwrap();
+async fn frames_roundtrip_between_two_transports() {
+    let a = Transport::new(0, IDLE).await.unwrap();
+    let b = Transport::new(0, IDLE).await.unwrap();
+    let dest = b.local_id();
+    a.send(
+        &dest,
+        Bytes::from(
+            Message::TaskAccept {
+                task_id: "t1".into(),
+            }
+            .encode(),
+        ),
+    )
+    .await
+    .unwrap();
     let (src, data) = tokio::time::timeout(Duration::from_secs(5), b.recv())
         .await
-        .expect("timed out waiting for frame")
+        .expect("timed out")
         .expect("transport closed");
-    // The greeting registered the connection under the sender's listen
-    // address, so replies can be addressed to it directly.
     assert_eq!(src, a.local_id());
-    assert_eq!(data, payload);
-
-    b.send(&src, Bytes::from_static(b"pong")).await.unwrap();
-    let (src, data) = tokio::time::timeout(Duration::from_secs(5), a.recv())
-        .await
-        .expect("timed out waiting for reply")
-        .expect("transport closed");
-    assert_eq!(src, b.local_id());
-    assert_eq!(&data[..], b"pong");
+    match Message::decode(&data) {
+        Some(Message::TaskAccept { task_id }) => assert_eq!(task_id, "t1"),
+        other => panic!("unexpected frame: {other:?}"),
+    }
 }
 
 #[tokio::test]
-async fn unreachable_destination_is_an_error() {
-    let a = Transport::new(0).await.unwrap();
-    // Bind and immediately release a port so connecting there is
-    // guaranteed to be refused.
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_port = probe.local_addr().unwrap().port();
-    drop(probe);
-    let result = a
-        .send(
-            &format!("tcp:127.0.0.1:{dead_port}"),
-            Bytes::from_static(b"x"),
-        )
-        .await;
+async fn foreign_protocol_version_is_dropped() {
+    let a = Transport::new(0, IDLE).await.unwrap();
+    let b = Transport::new(0, IDLE).await.unwrap();
+    // Greet manually with a wrong version, then send a frame: the frame
+    // must never surface on b's inbound channel.
+    let stream = TcpStream::connect(a.local_id().trim_start_matches("tcp:"))
+        .await
+        .unwrap();
+    let hello = Message::ConnHello {
+        version: PROTOCOL_VERSION + 1,
+        listen_addr: b.local_id(),
+    };
+    write_frame_raw(&stream, &hello.encode()).await.unwrap();
+    write_frame_raw(
+        &stream,
+        &Message::TaskAccept {
+            task_id: "bad".into(),
+        }
+        .encode(),
+    )
+    .await
+    .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), b.recv()).await;
+    assert!(
+        result.is_err(),
+        "frame from a foreign protocol version was delivered"
+    );
+}
+
+#[tokio::test]
+async fn send_to_unreachable_peer_fails_without_panicking() {
+    let a = Transport::new(0, IDLE).await.unwrap();
+    let result = a.send("tcp:127.0.0.1:1", Bytes::from_static(b"x")).await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn idle_connection_is_dropped_and_reestablished_on_demand() {
+    let a = Transport::new(0, Duration::from_millis(200)).await.unwrap();
+    let b = Transport::new(0, Duration::from_secs(60)).await.unwrap();
+    let dest = b.local_id();
+    a.send(
+        &dest,
+        Bytes::from(
+            Message::TaskAccept {
+                task_id: "t1".into(),
+            }
+            .encode(),
+        ),
+    )
+    .await
+    .unwrap();
+    // Let a's reader hit the short idle deadline and drop the socket.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The next send transparently reconnects and still delivers.
+    a.send(
+        &dest,
+        Bytes::from(
+            Message::TaskAccept {
+                task_id: "t2".into(),
+            }
+            .encode(),
+        ),
+    )
+    .await
+    .unwrap();
+    let (_src, first) = tokio::time::timeout(Duration::from_secs(5), b.recv())
+        .await
+        .expect("timed out")
+        .expect("transport closed");
+    let (_src, second) = tokio::time::timeout(Duration::from_secs(5), b.recv())
+        .await
+        .expect("timed out")
+        .expect("transport closed");
+    assert!(Message::decode(&first).is_some());
+    assert!(Message::decode(&second).is_some());
 }

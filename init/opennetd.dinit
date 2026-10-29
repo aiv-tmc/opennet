@@ -1,9 +1,5 @@
-# dinit service file for the OpenNet daemon.
-# Install:  cp init/opennetd.dinit /etc/dinit.d/opennetd
+# OpenNet daemon service for dinit.
 type = process
 command = /usr/local/bin/opennetd
-depends-on = network
 restart = true
 restart-delay = 2
-# Note: dinit has no StateDirectory equivalent; the daemon creates
-# /var/lib/opennet itself when it does not exist.
