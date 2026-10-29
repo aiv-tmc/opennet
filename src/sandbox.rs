@@ -16,127 +16,183 @@
 //! Every step degrades gracefully: an unshare failure (for example a
 //! daemon running without the needed capabilities) skips the namespace
 //! layer entirely so the task still starts; an unavailable cgroup
-//! hierarchy simply means no resource limits for that task.
-
-use std::ffi::CString;
-use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
-use tokio::process::Command;
+//! hierarchy simply means no resource limits for that task. On
+//! non-Linux platforms both layers are compile-time no-ops — the daemon
+//! and its tasks run unsandboxed but fully functional.
 
 use crate::config::SandboxCfg;
+use tokio::process::Command;
 
-/// Namespace flags applied to sandboxed processes: isolated mounts, hostname,
-/// IPC, PID view and networking.
-const UNSHARE_FLAGS: libc::c_int = libc::CLONE_NEWNS
-    | libc::CLONE_NEWUTS
-    | libc::CLONE_NEWIPC
-    | libc::CLONE_NEWPID
-    | libc::CLONE_NEWNET;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 /// Wire namespace isolation into a command before it is spawned.
 ///
-/// The hook runs in the child between fork and exec. An error there aborts
-/// the exec, so the namespace setup tolerates every failure internally —
-/// nothing here returns an error, an unprivileged daemon just gets no
-/// namespaces instead of failed tasks.
+/// On Linux the hook runs in the child between fork and exec; it tolerates
+/// every failure internally so an unprivileged daemon gets no namespaces
+/// instead of failed tasks. Everywhere else this is a no-op.
 pub fn apply_to_command(command: &mut Command, workdir: &std::path::Path, cfg: &SandboxCfg) {
-    if !cfg.namespaces {
-        return;
-    }
-    let Ok(workdir) = CString::new(workdir.as_os_str().as_bytes()) else {
-        return; // path with an interior nul: run without namespace mounts
-    };
-    let read_only_root = cfg.read_only_root;
-    // SAFETY: `pre_exec` runs once in the child before exec in the
-    // single-threaded post-fork window; the closure only performs
-    // syscalls. tokio's Command provides the inherent `pre_exec` hook.
-    unsafe {
-        command.pre_exec(move || enter_namespaces(&workdir, read_only_root));
-    }
-}
-
-/// Child-side namespace setup executed after fork and before exec.
-fn enter_namespaces(workdir: &CString, read_only_root: bool) -> io::Result<()> {
-    // SAFETY: pure syscalls with constant arguments on freshly created
-    // per-process namespaces; nothing here touches shared memory.
-    unsafe {
-        if libc::unshare(UNSHARE_FLAGS) != 0 {
-            // Without the namespaces the mount steps below would leak into
-            // the host mount tree, so skip the whole sandbox layer and let
-            // the task run unsandboxed instead of failing to start.
-            return Ok(());
-        }
-        // Make the mount tree private so none of our mounts propagate back
-        // to the host.
-        let root = cstring("/");
-        libc::mount(
-            std::ptr::null(),
-            root.as_ptr(),
-            std::ptr::null(),
-            libc::MS_REC | libc::MS_PRIVATE,
-            std::ptr::null(),
-        );
-        if read_only_root {
-            libc::mount(
-                std::ptr::null(),
-                root.as_ptr(),
-                std::ptr::null(),
-                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
-                std::ptr::null(),
-            );
-        }
-        // A private scratch filesystem over the working directory: the one
-        // writable place the task can see, bounded in size by the cgroup
-        // memory limit.
-        let tmpfs = cstring("tmpfs");
-        libc::mount(
-            tmpfs.as_ptr(),
-            workdir.as_ptr(),
-            tmpfs.as_ptr(),
-            0,
-            std::ptr::null(),
-        );
-        bring_loopback_up();
-    }
-    Ok(())
-}
-
-/// Wrap a constant string as a C string.
-fn cstring(text: &str) -> CString {
-    CString::new(text).expect("constant without interior nul")
-}
-
-/// Bring the loopback interface up inside the fresh network namespace so
-/// sandboxed runners can reach their local worker socket.
-fn bring_loopback_up() {
-    // SAFETY: standard socket/ioctl dance on a freshly created socket fd.
-    unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        if fd < 0 {
-            return;
-        }
-        let mut ifr: libc::ifreq = std::mem::zeroed();
-        std::ptr::copy_nonoverlapping(c"lo".as_ptr(), ifr.ifr_name.as_mut_ptr(), 3);
-        if libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr) == 0 {
-            ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-            let _ = libc::ioctl(fd, libc::SIOCSIFFLAGS, &mut ifr);
-        }
-        libc::close(fd);
-    }
+    #[cfg(target_os = "linux")]
+    linux::apply_to_command(command, workdir, cfg);
+    #[cfg(not(target_os = "linux"))]
+    let _ = (command, workdir, cfg);
 }
 
 /// Handle to one task's cgroup; kills its processes and removes the
-/// directory when dropped.
+/// directory when dropped. Empty on platforms without cgroup v2.
 pub struct CgroupGuard {
+    #[cfg(target_os = "linux")]
     dir: PathBuf,
 }
 
 impl CgroupGuard {
     /// Create a cgroup for `name`, write the limits and move `pid` into it.
-    /// Returns `None` when cgroups v2 are unavailable — the caller simply
-    /// has no resource limits for this task.
+    /// Returns `None` when cgroup v2 is unavailable (including all
+    /// non-Linux platforms) — the caller simply has no resource limits for
+    /// this task.
     pub fn attach(
+        name: &str,
+        pid: u32,
+        cfg: &SandboxCfg,
+        inherit_memory_mb: u64,
+        inherit_cpu_percent: u32,
+    ) -> Option<CgroupGuard> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::attach_cgroup(name, pid, cfg, inherit_memory_mb, inherit_cpu_percent)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (name, pid, cfg, inherit_memory_mb, inherit_cpu_percent);
+            None
+        }
+    }
+}
+
+impl Drop for CgroupGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        linux::teardown_cgroup(&self.dir);
+    }
+}
+
+/// Linux implementation of the sandbox; empty on other platforms.
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::*;
+    use std::ffi::CString;
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+
+    /// Namespace flags applied to sandboxed processes: isolated mounts,
+    /// hostname, IPC, PID view and networking.
+    const UNSHARE_FLAGS: libc::c_int = libc::CLONE_NEWNS
+        | libc::CLONE_NEWUTS
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWPID
+        | libc::CLONE_NEWNET;
+
+    /// Wire namespace isolation into a command before it is spawned.
+    ///
+    /// The hook runs in the child between fork and exec. An error there
+    /// aborts the exec, so the namespace setup tolerates every failure
+    /// internally — nothing here returns an error, an unprivileged daemon
+    /// just gets no namespaces instead of failed tasks.
+    pub(super) fn apply_to_command(
+        command: &mut Command,
+        workdir: &std::path::Path,
+        cfg: &SandboxCfg,
+    ) {
+        if !cfg.namespaces {
+            return;
+        }
+        let Ok(workdir) = CString::new(workdir.as_os_str().as_bytes()) else {
+            return; // path with an interior nul: run without namespace mounts
+        };
+        let read_only_root = cfg.read_only_root;
+        // SAFETY: `pre_exec` runs once in the child before exec in the
+        // single-threaded post-fork window; the closure only performs
+        // syscalls. tokio's Command provides the inherent `pre_exec` hook,
+        // so no std CommandExt import is needed.
+        unsafe {
+            command.pre_exec(move || enter_namespaces(&workdir, read_only_root));
+        }
+    }
+
+    /// Child-side namespace setup executed after fork and before exec.
+    fn enter_namespaces(workdir: &CString, read_only_root: bool) -> io::Result<()> {
+        // SAFETY: pure syscalls with constant arguments on freshly created
+        // per-process namespaces; nothing here touches shared memory.
+        unsafe {
+            if libc::unshare(UNSHARE_FLAGS) != 0 {
+                // Without the namespaces the mount steps below would leak
+                // into the host mount tree, so skip the whole sandbox layer
+                // and let the task run unsandboxed instead of failing to
+                // start.
+                return Ok(());
+            }
+            // Make the mount tree private so none of our mounts propagate
+            // back to the host.
+            let root = cstring("/");
+            libc::mount(
+                std::ptr::null(),
+                root.as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            );
+            if read_only_root {
+                libc::mount(
+                    std::ptr::null(),
+                    root.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                    std::ptr::null(),
+                );
+            }
+            // A private scratch filesystem over the working directory: the
+            // one writable place the task can see, bounded in size by the
+            // cgroup memory limit.
+            let tmpfs = cstring("tmpfs");
+            libc::mount(
+                tmpfs.as_ptr(),
+                workdir.as_ptr(),
+                tmpfs.as_ptr(),
+                0,
+                std::ptr::null(),
+            );
+            bring_loopback_up();
+        }
+        Ok(())
+    }
+
+    /// Wrap a constant string as a C string.
+    fn cstring(text: &str) -> CString {
+        CString::new(text).expect("constant without interior nul")
+    }
+
+    /// Bring the loopback interface up inside the fresh network namespace
+    /// so sandboxed runners can reach their local worker socket.
+    fn bring_loopback_up() {
+        // SAFETY: standard socket/ioctl dance on a freshly created socket.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            if fd < 0 {
+                return;
+            }
+            let mut ifr: libc::ifreq = std::mem::zeroed();
+            std::ptr::copy_nonoverlapping(c"lo".as_ptr(), ifr.ifr_name.as_mut_ptr(), 3);
+            if libc::ioctl(fd, libc::SIOCGIFFLAGS, &mut ifr) == 0 {
+                ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+                let _ = libc::ioctl(fd, libc::SIOCSIFFLAGS, &mut ifr);
+            }
+            libc::close(fd);
+        }
+    }
+
+    /// Create a cgroup for `name`, write the limits and move `pid` into
+    /// it. Returns `None` when cgroups v2 are unavailable.
+    pub(super) fn attach_cgroup(
         name: &str,
         pid: u32,
         cfg: &SandboxCfg,
@@ -177,14 +233,14 @@ impl CgroupGuard {
         std::fs::write(dir.join("cgroup.procs"), pid.to_string()).ok()?;
         Some(CgroupGuard { dir })
     }
-}
 
-impl Drop for CgroupGuard {
-    fn drop(&mut self) {
+    /// Kill every remaining process in the cgroup and remove its
+    /// directory.
+    pub(super) fn teardown_cgroup(dir: &std::path::Path) {
         // cgroup.kill exists since kernel 5.14; fall back to signaling
         // every listed pid when the file is missing.
-        if std::fs::write(self.dir.join("cgroup.kill"), "1").is_err() {
-            if let Ok(procs) = std::fs::read_to_string(self.dir.join("cgroup.procs")) {
+        if std::fs::write(dir.join("cgroup.kill"), "1").is_err() {
+            if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
                 for line in procs.lines() {
                     if let Ok(pid) = line.trim().parse::<libc::pid_t>() {
                         unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -192,35 +248,36 @@ impl Drop for CgroupGuard {
                 }
             }
         }
-        let _ = std::fs::remove_dir(&self.dir);
+        let _ = std::fs::remove_dir(dir);
     }
-}
 
-/// Locate the daemon's cgroup v2 subtree: `/proc/self/cgroup` holds the
-/// cgroup-relative path of the current process, which is writable when
-/// systemd delegates it (`Delegate=yes`) or when the daemon runs as root
-/// with write access to /sys/fs/cgroup.
-fn delegated_cgroup_root() -> Option<PathBuf> {
-    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let line = text.lines().find(|line| line.starts_with("0::"))?;
-    let rel = line.trim_start_matches("0::").trim_start_matches('/');
-    let base = PathBuf::from("/sys/fs/cgroup").join(rel);
-    if base.join("cgroup.controllers").exists() {
-        Some(base.join("opennet"))
-    } else {
-        None
+    /// Locate the daemon's cgroup v2 subtree: `/proc/self/cgroup` holds the
+    /// cgroup-relative path of the current process, which is writable when
+    /// systemd delegates it (`Delegate=yes`) or when the daemon runs as
+    /// root with write access to /sys/fs/cgroup.
+    fn delegated_cgroup_root() -> Option<PathBuf> {
+        let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let line = text.lines().find(|line| line.starts_with("0::"))?;
+        let rel = line.trim_start_matches("0::").trim_start_matches('/');
+        let base = PathBuf::from("/sys/fs/cgroup").join(rel);
+        if base.join("cgroup.controllers").exists() {
+            Some(base.join("opennet"))
+        } else {
+            None
+        }
     }
-}
 
-/// Reduce an arbitrary task name to a filesystem-safe cgroup directory name.
-fn sanitize(name: &str) -> String {
-    name.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    /// Reduce an arbitrary task name to a filesystem-safe cgroup directory
+    /// name.
+    fn sanitize(name: &str) -> String {
+        name.chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
 }

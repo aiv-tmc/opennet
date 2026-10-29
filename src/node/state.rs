@@ -7,7 +7,8 @@
 //! on the hot path would buy no durability. The *final* charge (`settle`)
 //! and completed donations (executor credit) persist immediately, and any
 //! stale reservations surviving from older state files are still
-//! refunded on load. Save failures are logged, never silently dropped.
+//! refunded on load. The initial state is materialized on first boot so
+//! the state file always exists; later boots never rewrite it on load.
 
 use crate::config::{Limits, TrustCfg};
 use crate::trust::points::compute_points;
@@ -101,10 +102,11 @@ impl NodeState {
     /// Load persisted state from `<state_dir>/state.json` or start with the
     /// genesis trust endowment; a malformed file is reported as an error.
     ///
-    /// Reservations surviving from older state files (or an unclean
-    /// shutdown of an older daemon version) are refunded into trust on the
-    /// spot: their tasks can never complete after a restart, so keeping
-    /// the deduction would silently burn the user's trust.
+    /// On first boot (no state file) the initial state is written to disk
+    /// so the file always exists. Reservations surviving from older state
+    /// files are refunded into trust on the spot: their tasks can never
+    /// complete after a restart, so keeping the deduction would silently
+    /// burn the user's trust. Clean restarts never rewrite the file.
     pub fn load(
         state_dir: &Path,
         default_mode: Mode,
@@ -114,13 +116,16 @@ impl NodeState {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("cannot create state dir {}", state_dir.display()))?;
         let state_file = state_dir.join("state.json");
+        let existed = state_file.exists();
         let mut mode = default_mode;
         let mut trust = trust_cfg.genesis_trust;
         let mut consumed = 0u64;
         let mut tasks_completed = 0u64;
         let mut tasks_failed = 0u64;
         let mut reservations = HashMap::new();
-        if let Ok(text) = std::fs::read_to_string(&state_file) {
+        if existed {
+            let text = std::fs::read_to_string(&state_file)
+                .with_context(|| format!("cannot read state file {}", state_file.display()))?;
             let persisted: PersistedState = serde_json::from_str(&text)
                 .with_context(|| format!("invalid state file {}", state_file.display()))?;
             mode = persisted.mode;
@@ -149,8 +154,10 @@ impl NodeState {
             limits,
             reservations,
         };
-        if refunded != 0 {
-            // Persist the refund so a second crash cannot double-release.
+        if !existed || refunded != 0 {
+            // First boot: materialize the initial state so the file always
+            // exists. Refund: persist it so a second crash cannot
+            // double-release. Clean reloads skip the write entirely.
             let _ = state.save();
         }
         Ok(state)
@@ -268,13 +275,15 @@ mod tests {
     }
 
     #[test]
-    fn fresh_state_uses_genesis_trust_and_zero_counters() {
-        let state =
-            NodeState::load(&scratch_dir("st-fresh"), Mode::Peer, limits(), &trust_cfg()).unwrap();
+    fn fresh_state_uses_genesis_trust_materializes_the_file_and_zero_counters() {
+        let dir = scratch_dir("st-fresh");
+        let state = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
         assert_eq!(state.trust, 100);
         assert_eq!(state.consumed, 0);
         assert!(state.reservations.is_empty());
         assert!(state.points >= 1);
+        // First boot must materialize the state file.
+        assert!(dir.join("state.json").exists());
     }
 
     #[test]

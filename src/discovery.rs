@@ -4,7 +4,8 @@
 //! the payload is strictly validated (`HELLO tcp:<ip>:<port>` with a real
 //! socket address) so a spoofed datagram cannot inject arbitrary addresses.
 //! The multicast group is joined on every local IPv4 interface enumerated
-//! through getifaddrs, so discovery works on multi-homed hosts.
+//! through getifaddrs, so discovery works on multi-homed hosts (and
+//! compiles on BSD-derived platforms where `sa_family` is a single byte).
 
 use crate::config::NetworkCfg;
 use crate::dht::Dht;
@@ -40,7 +41,10 @@ fn ipv4_interfaces() -> Vec<Ipv4Addr> {
         let mut cursor = ifap;
         while !cursor.is_null() {
             let ifa = &*cursor;
-            if !ifa.ifa_addr.is_null() && (*ifa.ifa_addr).sa_family == libc::AF_INET as u16 {
+            // `sa_family` is u16 on Linux and u8 on macOS/BSD; widening
+            // both to u32 makes the family check compile on every
+            // platform without type annotations.
+            if !ifa.ifa_addr.is_null() && (*ifa.ifa_addr).sa_family as u32 == libc::AF_INET as u32 {
                 let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
                 // sin_addr is stored in network byte order; from_be yields a
                 // host-order u32 that Ipv4Addr::from renders as a.b.c.d.
