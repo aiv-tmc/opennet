@@ -3,8 +3,8 @@
 //!
 //! Every connection gets its own task, so a slow or stuck client never
 //! blocks the others. The parser takes the subcommand token and hands the
-//! remainder of the line to the handler, so multi-word arguments (like the
-//! command of `compute`) survive intact.
+//! remainder of the line to the handler, so multi-word arguments (like
+//! the command of `compute`) survive intact.
 
 use crate::compute;
 use crate::config::Config;
@@ -299,8 +299,9 @@ async fn swarm_status(ctx: &Arc<Ctx>) -> String {
 
 /// Grant or revoke swarm consent and persist it to the state directory so
 /// the choice survives daemon restarts; the change takes effect on the
-/// next heartbeat round. Revoking consent stops future launches and
-/// announcements, while already running shards finish their plan lifetime.
+/// next heartbeat round. Revoking consent announces a signed retraction to
+/// every known peer immediately, so placement stops instead of waiting for
+/// offers to age out; already running shards finish their plan lifetime.
 async fn swarm_set(ctx: &Arc<Ctx>, program: Option<&str>, enabled: bool) -> String {
     let state_dir = ctx.config.paths.state_dir.clone();
     let mut consent = ctx.swarm.lock().await;
@@ -319,6 +320,8 @@ async fn swarm_set(ctx: &Arc<Ctx>, program: Option<&str>, enabled: bool) -> Stri
             if enabled {
                 format!("swarm consent granted for '{}'\n", consent.program)
             } else {
+                drop(consent);
+                swarm::broadcast_leave(ctx).await;
                 "swarm consent revoked\n".to_string()
             }
         }
@@ -389,6 +392,14 @@ mod tests {
         assert!(out.contains("revoked"));
         let reloaded = swarm::Consent::load(&ctx.config.paths.state_dir, &ctx.config.swarm);
         assert!(!reloaded.enabled);
+    }
+
+    #[tokio::test]
+    async fn unknown_mode_is_an_error() {
+        let (ctx, _rx) = make_ctx("ctl-bad-mode").await;
+        let out = dispatch(&ctx, "mode bogus").await;
+        assert!(out.contains("error:"));
+        assert_eq!(ctx.state.lock().await.mode, Mode::Peer);
     }
 
     #[tokio::test]

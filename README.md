@@ -12,15 +12,19 @@ machine is to the network, the more capacity it can pull back.
 * Daemons find each other automatically on the LAN via multicast
   announcements; no central server and no configuration of peers is needed.
 * Each node periodically announces its identity, operating mode, trust
-  coefficient and hardware price over signed, timestamped, persistent TCP
-  connections.
+  coefficient and hardware price over signed, timestamped frames;
+  announcements travel on persistent TCP connections validated by a
+  versioned greeting whose advertised listen address must match the
+  peer's real socket IP.
 * Hardware is priced in **capacity points**, computed from the capacity
   the node actually offers to the network (CPU share and RAM limit from the
   config), announced with the identity. One task reserves
-  `points × ceil(timeout/60)` trust units on its provider; the final charge
-  follows the *actual* billed seconds reported with the result.
-* A node that wants work done sends a **bid** carrying a signed snapshot of
-  its trust and consumption counters. The provider serves the highest
+  `points × ceil(timeout/60)` trust units on its provider; the final
+  charge follows the *actual* billed seconds, capped by the wall time
+  observed between accept and result plus a small clock-skew slack, and can
+  never exceed the reservation.
+* A node that wants work done sends a **bid** carrying a signed snapshot
+  of its trust and consumption counters. The provider serves the highest
   offer first, never runs more than `max_tasks` tasks at once, and accepts
   only while `trust − consumed − in_flight ≥ min_trust`. On completion the
   consumer's `consumed` counter grows and its trust drops; the provider's
@@ -85,7 +89,7 @@ Socket: `/run/opennet/control.sock` (override with `--socket` or
 | `reputation`                         | peer reputation table                        |
 | `swarm status`                       | consent state, local shards, live plans      |
 | `swarm enable <program>`             | grant consent to host a shared program     |
-| `swarm disable`                      | revoke swarm consent                         |
+| `swarm disable`                      | revoke swarm consent (announced immediately) |
 | `swarm run <program> <prompt-file>`  | run one shared program across the swarm    |
 | `shutdown`                           | stop the daemon gracefully                   |
 
@@ -99,18 +103,19 @@ seconds.
 
 Every compute task and every swarm shard runner runs inside a sandbox,
 applied best-effort on Linux and degrading gracefully where the platform
-does not allow a step:
+does not allow a step. Two profiles exist:
 
-* **Namespaces**: fresh mount, UTS, IPC, PID and network namespaces. The
-  mount tree is made private, the root is remounted read-only, and the
-  task gets a private tmpfs over its working directory — the only writable
-  place it can see. Sandboxed processes have no network access except the
-  loopback interface, which is brought up inside the namespace for swarm
-  runners talking to their local worker.
-* **cgroups v2**: each task gets its own cgroup under the daemon's
-  delegated subtree (the systemd unit sets `Delegate=yes`) with
-  `memory.max`, `cpu.max` and `pids.max`; the cgroup is killed and
-  removed when the task ends.
+* **Tasks** get full isolation: fresh mount, UTS, IPC, PID and network
+  namespaces. The mount tree is made private, the root is remounted
+  read-only, and the task gets a private tmpfs over its working directory —
+  the only writable place it can see. Sandboxed processes have no network
+  access; the loopback interface is brought up inside the namespace for
+  programs that expect a working `lo`.
+* **Swarm runners** get the same namespaces minus the network namespace:
+  they must reach the worker's listener, which is bound on the daemon's
+  loopback, and a private network namespace would put it behind a
+  boundary they cannot cross. The runner's only network exposure is the
+  loopback address the worker hands it.
 
 Tuning lives in the `[sandbox]` section; `memory_mb = 0` and
 `cpu_percent = 0` inherit the `[limits]` values. Setting `namespaces =
@@ -118,13 +123,19 @@ false` or `cgroup = false` disables the respective layer.
 
 ```toml
 [sandbox]
-namespaces = true        # fresh mount/UTS/IPC/PID/network namespaces
+namespaces = true        # fresh mount/UTS/IPC/PID namespaces (plus network for tasks)
 read_only_root = true    # read-only filesystem + private tmpfs workdir
 cgroup = true            # per-task cgroup v2 limits
 memory_mb = 0            # 0 = inherit limits.ram_mb
 cpu_percent = 0          # 0 = inherit limits.cpu_percent
 pids_max = 512           # fork bomb protection per task
 ```
+
+Note: with the stock systemd unit the daemon runs unprivileged, so
+namespace creation degrades silently and the sandbox reduces to cgroup
+limits. Run the daemon with sufficient privileges (or as root under
+runit/OpenRC/dinit) for full isolation — keeping in mind that swarm runners
+then still share the daemon's network namespace by design.
 
 ## Swarm mode: one big program across the LAN
 
@@ -138,9 +149,10 @@ opt-in:
 * **Explicit consent.** `opennetctl swarm enable <program>` (persisted in
   `/var/lib/opennet/swarm.toml`) grants hosting for one named program
   only; the artifact must live in the artifacts directory and its blake3
-  digest must match the manifest.
-* **Hash-verified artifacts.** A shard process starts only from a manifest
-  plus artifact pair whose digest verifies; manifests are JSON:
+  digest must match the manifest. `swarm disable` announces a signed
+  retraction to all peers immediately.
+* **Hash-verified artifacts.** A shard process starts only from a
+  manifest plus artifact pair whose digest verifies; manifests are JSON:
 
 ```json
 {
@@ -152,17 +164,22 @@ opt-in:
 }
 ```
 
-The runner command is executed with the sandbox applied and a scrubbed
-environment exporting `PLAN_ID`, `SHARD_INDEX`, `LAYER_FROM`, `LAYER_TO`,
-`ARTIFACT`, `PORT`, `NEXT_ADDR`, `COORD_ADDR` and `RAM_MB`. It connects
-back to the worker's local listener and speaks one length-prefixed frame
-protocol:
+The runner command is exec'd directly (no shell), with the sandbox applied
+and a scrubbed environment exporting `PLAN_ID`, `SHARD_INDEX`, `LAYER_FROM`,
+`LAYER_TO`, `ARTIFACT`, `PORT`, `NEXT_ADDR`, `COORD_ADDR` and `RAM_MB`. It
+connects back to the worker's local listener and speaks one
+length-prefixed frame protocol:
 
-* worker → runner: `[u32 len][payload]` — pipeline input (activation
-  tensors for an LLM);
+* worker → runner: `[u32 len][u8 tag = 0][payload]` — pipeline input
+  (activation tensors for an LLM); the tag byte is always 0 from the
+  worker;
 * runner → worker: `[u32 len][u8 tag][payload]` — tag 1 forwards the
-  payload to the next shard, tag 2 delivers output to the coordinator,
-  tag 3 reports readiness, tag 4 reports completion.
+  payload to the next shard (the last shard has an empty `NEXT_ADDR` and
+  must not forward), tag 2 delivers output to the coordinator, tag 3
+  reports readiness, tag 4 reports completion.
+
+Frames in both directions are capped at the wire frame limit (1 MiB), so
+the local protocol can never produce frames the transport would reject.
 
 Any program implementing these frames can serve as a shard runner. The
 coordinator (`opennetctl swarm run <program> <prompt-file>`) must hold
@@ -199,7 +216,7 @@ hello_interval_secs = 5          # discovery announcement interval
 heartbeat_interval_secs = 30     # signed announcement interval
 task_timeout_secs = 300          # default wall-clock limit per task
 ann_max_age_secs = 120           # reject announcements older than this
-ann_future_skew_secs = 120       # reject announcements from the far future
+ann_future_skew_secs = 120        # reject announcements from the far future
 
 [paths]
 state_dir = "/var/lib/opennet"   # identity key + state + reputation + consent
@@ -222,9 +239,11 @@ pids_max = 512
 ```
 
 State files in `state_dir`: `node.key` (ed25519 secret, 0600),
-`state.json` (mode, trust, consumed, reservations, task stats),
-`reputation.json`, `swarm.toml` (consent). Reservations are persisted so
-an unclean shutdown refunds in-flight tasks instead of burning trust.
+`state.json` (mode, trust, consumed, counters; written atomically with
+owner-only permissions), `reputation.json`, `swarm.toml` (consent).
+Reservations are held in memory: an unclean shutdown discards them, and
+reservations recorded by older versions are refunded at load time —
+nothing is owed across restarts either way.
 
 ## Documentation
 
@@ -233,6 +252,7 @@ an unclean shutdown refunds in-flight tasks instead of burning trust.
 * `docs/swarm.md` — consent, artifacts, placement protocol, runner contract.
 * `docs/operations.md` — service management, state files, troubleshooting,
   benchmarks, security checklist.
+* `TEST.md` — test layout, regression pins, integration scenarios.
 
 ## Benchmarks
 
@@ -264,30 +284,35 @@ as the daemon runs with sufficient privileges.
 
 ## Security notes
 
-* Announcements, swarm offers, bids and assignments are ed25519-signed
-  and timestamped; the node id is blake3 of the signer's public key, so a
-  valid signature proves identity, and stale messages are rejected as
-  replays. Every failed verification is penalized against the connection
-  address, never against a claimed node id, so a replay cannot damage the
-  reputation of the node it borrows.
+* Announcements, swarm offers, bids, launches and assignments are
+  ed25519-signed and timestamped; the node id is blake3 of the signer's
+  public key, so a valid signature proves identity, and stale messages are
+  rejected as replays. Every failed verification is penalized against
+  the connection address, never against a claimed node id, so a replay
+  cannot damage the reputation of the node it borrows.
+* Connection greetings are validated: the advertised listen address must
+  match the peer's real socket IP, so unsigned messages (`TaskResult`,
+  `ShardFwd`, …) cannot be injected through a borrowed address.
 * Providers verify the bid's signed trust against the last announced
   value and enforce `trust − consumed − in_flight ≥ min_trust`; assignments
   are executed only for task ids accepted from the exact signing node.
-* Tasks and shard runners execute sandboxed: private namespaces with a
-  read-only root and a tmpfs scratch space, no network access beyond
-  loopback, and cgroup v2 limits on memory, CPU and process count. The
-  sandbox is defense-in-depth for mutually trusting LAN peers, not a
-  boundary against fully hostile code — review the `[sandbox]` knobs
-  before exposing the control socket more widely.
+* Task billing is capped by the wall time observed between accept and
+  result, so a misreporting provider cannot overcharge beyond the task's
+  actual lifetime plus a small clock-skew slack.
+* Tasks and shard runners execute sandboxed (see above). The sandbox is
+  defense-in-depth for mutually trusting LAN peers, not a boundary against
+  fully hostile code: the transport is unencrypted, and trust accounting is
+  self-attested by each node. Review the `[sandbox]` knobs before exposing
+  the control socket more widely.
 * Swarm shards run only hash-verified artifacts from the local artifacts
   directory under an explicit per-program consent with RAM/CPU caps; the
   consent file is root-owned state and takes effect only after an
   explicit `swarm enable`.
 * The control socket trusts everyone with write access — protect it via
   filesystem permissions (default: root-only `/run/opennet`).
-* The transport enforces a connection limit, greeting deadlines, idle
-  read deadlines and a hard frame-size cap so slow or flooding peers
-  cannot exhaust daemon memory.
+* The transport enforces a connection limit (released by the socket's own
+  reader on death), greeting deadlines, idle read deadlines and a hard
+  frame-size cap so slow or flooding peers cannot exhaust daemon memory.
 
 ## Roadmap
 
@@ -300,3 +325,5 @@ as the daemon runs with sufficient privileges.
    swarm shards. **done**
 5. Result verification and stronger sandboxing (seccomp, per-task
    seccomp-bpf profiles, user namespaces without root). **planned**
+6. Authenticated, encrypted transport (X25519 + AEAD handshake bound to
+   node identity) so LAN MitM cannot read or alter frames. **planned**

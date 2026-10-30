@@ -1,278 +1,362 @@
-//! Swarm coordinator: builds a signed placement plan from consenting
-//! peers and drives the pipeline to completion.
+//! Coordinating one swarm run: placement, launch, prompt injection,
+//! pipeline completion.
 //!
-//! The coordinator must hold consent for the program itself. Layer space
-//! is split across candidates in proportion to their offered shard RAM,
-//! rounded to whole layers; a sequential chain of shards forms the
-//! pipeline and each launch carries the next shard's address so every
-//! runner knows where to forward. Payloads flow as `ShardFwd` frames along
-//! the chain and `ShardOut` frames back; the run ends when the last shard
-//! reports completion or a deadline expires, at which point every shard
-//! receives `SwarmDone` and tears down.
+//! The coordinator must itself hold consent for the program. It
+//! collects verified offers from the routing table, splits the manifest
+//! layer space across hosts proportional to offered RAM — hosts
+//! offering nothing, or less than one layer's worth of proportional
+//! share, are skipped; the last contributing host takes the remainder —
+//! signs one `Message::ShardLaunch` per shard, and waits for every
+//! shard's readiness before injecting the prompt. From then on it
+//! relays pipeline frames between shard hosts, collects output (capped)
+//! and finishes on completion, on failure, or on the wall-clock
+//! deadline.
 
 use crate::daemon::{send_msg, Ctx};
 use crate::dht::PeerInfo;
 use crate::message::Message;
-use crate::swarm::{PlanEvent, PlanState, ShardSlot};
-use crate::trust::now_unix;
-use anyhow::{bail, Context, Result};
+use crate::swarm::{finish_plan, peer_offers, PlanEvent, PlanState, ShardSlot};
+use crate::transport::MAX_FRAME;
+use anyhow::{bail, Result};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// How long to wait for all shards of a plan to report ready.
-const READY_TIMEOUT: Duration = Duration::from_secs(120);
-/// Hard deadline for one whole pipeline run.
+/// Overall wall-clock budget for one plan.
 const RUN_TIMEOUT: Duration = Duration::from_secs(1800);
-/// Maximum prompt payload injected into the pipeline.
-const MAX_PROMPT_BYTES: usize = 16 * 1024 * 1024;
+/// Patience for shard readiness during launch.
+const READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// Total output a plan may produce before the coordinator aborts it; a
+/// runaway or malicious last shard cannot exhaust coordinator memory.
+const OUTPUT_CAP: usize = 64 * 1024 * 1024;
 
-/// Split `layers` into contiguous shard ranges proportional to `caps`,
-/// rounded to whole layers, returning one `(from, to)` per cap and skipping
-/// caps too small to hold a single layer. The ranges always cover
-/// `[0, layers)` exactly.
-pub(crate) fn split_layers(layers: u32, caps: &[u64]) -> Vec<(u32, u32)> {
-    let total: u64 = caps.iter().sum();
-    let mut out = Vec::with_capacity(caps.len());
-    let mut from = 0u32;
-    for (i, cap) in caps.iter().enumerate() {
-        if from >= layers {
-            break;
-        }
-        let to = if i == caps.len() - 1 || *cap == 0 {
-            layers
-        } else {
-            let share = ((*cap as f64 / total.max(1) as f64) * layers as f64).round() as u32;
-            (from + share).max(from + 1).min(layers)
-        };
-        if to > from {
-            out.push((from, to));
-            from = to;
-        }
-    }
-    out
-}
-
-/// Run `program` across the swarm with the contents of `prompt_path` as
-/// the first pipeline payload, returning the collected output text.
+/// Run `program` over the swarm with the contents of `prompt_path` as
+/// the first shard's pipeline input; returns the final output text.
 pub async fn run_program(ctx: &Arc<Ctx>, program: &str, prompt_path: &str) -> Result<String> {
+    // The prompt becomes one ShardFwd frame; read it and reject
+    // oversized prompts before any launch leaves this node.
+    let prompt = std::fs::read(prompt_path)
+        .map_err(|err| anyhow::anyhow!("cannot read prompt file {prompt_path}: {err}"))?;
+    if prompt.is_empty() {
+        bail!("empty prompt");
+    }
+    if prompt.len() > MAX_FRAME {
+        bail!("prompt exceeds the {}-byte frame limit", MAX_FRAME);
+    }
+    // The coordinator must itself hold consent for the program.
     let consent = ctx.swarm.lock().await.clone();
     if !consent.allows(program) {
-        bail!("this node has no swarm consent for '{program}'");
+        bail!("coordinator holds no consent for {program}");
     }
-    let spec = consent
-        .verified_spec()
-        .context("cannot verify program artifacts")?;
-    let prompt = std::fs::read(prompt_path)
-        .with_context(|| format!("cannot read prompt file {prompt_path}"))?;
-    if prompt.len() > MAX_PROMPT_BYTES {
-        bail!("prompt file exceeds {} bytes", MAX_PROMPT_BYTES);
-    }
-
-    // Placement: consenting peers for this exact program, offering enough
-    // RAM to be useful, ordered by their offer.
-    let mut candidates: Vec<PeerInfo> = ctx
+    let spec = consent.verified_spec()?;
+    drop(consent);
+    // Only peers that currently offer this program with nonzero
+    // capacity; zero offers are dropped so placement never divides by
+    // an empty pool.
+    let candidates: Vec<PeerInfo> = ctx
         .dht
         .lock()
         .await
-        .swarm_candidates(program)
+        .all_peers()
         .into_iter()
-        .filter(|peer| peer.swarm_ram_mb >= spec.shard_ram_mb / 2)
+        .filter(|peer| peer_offers(peer, program) && peer.swarm_ram_mb > 0)
         .collect();
-    candidates.sort_by_key(|peer| std::cmp::Reverse(peer.swarm_ram_mb));
     if candidates.is_empty() {
-        bail!("no consenting peers offer '{program}'");
+        bail!("no swarm offers for {program}");
     }
-    let caps: Vec<u64> = candidates.iter().map(|peer| peer.swarm_ram_mb).collect();
-    let ranges = split_layers(spec.layers, &caps);
-    let shards: Vec<ShardSlot> = candidates
+    // Random plan id; also the key for plan state everywhere.
+    let plan_id = format!("{:016x}", rand::random::<u64>());
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<PlanEvent>();
+    let slots: Vec<ShardSlot> = candidates
         .iter()
-        .take(ranges.len())
         .map(|peer| ShardSlot {
             addr: peer.addr.clone(),
             node_id: peer.node_id.clone(),
         })
         .collect();
-    let plan_id = format!("{:016x}", rand::random::<u64>());
-
-    // Register the plan before launching so dispatcher events have a home.
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<PlanEvent>();
     ctx.swarm_plans.lock().await.insert(
         plan_id.clone(),
         PlanState {
-            shards: shards.clone(),
+            shards: slots.clone(),
             ready: HashSet::new(),
             events: events_tx,
         },
     );
-
-    // Sign and send one launch per shard; `next_addr` links the pipeline.
-    for (index, slot) in shards.iter().enumerate() {
-        let (layer_from, layer_to) = ranges[index];
-        let next_addr = shards
-            .get(index + 1)
-            .map(|next| next.addr.clone())
-            .unwrap_or_default();
-        let unix_ts = now_unix();
-        let signature = ctx.identity.sign(&Message::launch_signing_payload(
-            &plan_id,
-            index as u32,
-            program,
-            &spec.artifact_hash,
-            layer_from,
-            layer_to,
-            &next_addr,
-            unix_ts,
-        ));
+    let caps: Vec<u64> = candidates.iter().map(|peer| peer.swarm_ram_mb).collect();
+    let ranges = split_layers(spec.layers, &caps);
+    if ranges.is_empty() {
+        ctx.swarm_plans.lock().await.remove(&plan_id);
+        bail!("no usable placement for {program}");
+    }
+    // Sign and send one launch per shard; a single unreachable host
+    // aborts the plan before any shard starts executing.
+    for (slot, (host, (from, to))) in slots.iter().zip(ranges.iter()).enumerate() {
+        let shard_index = slot as u32;
+        let next_addr = match slots.get(slot + 1) {
+            Some(next) => next.addr.clone(),
+            // The empty next address tells the last shard it owns the
+            // plan output; its runner must deliver with tag 2, not
+            // tag 1.
+            None => String::new(),
+        };
+        let unix_ts = crate::trust::now_unix();
         let launch = Message::ShardLaunch {
             plan_id: plan_id.clone(),
-            shard_index: index as u32,
+            shard_index,
             program: program.to_string(),
             artifact_hash: spec.artifact_hash.clone(),
-            layer_from,
-            layer_to,
+            layer_from: *from,
+            layer_to: *to,
             ram_mb: spec.shard_ram_mb,
-            next_addr,
+            next_addr: next_addr.clone(),
             unix_ts,
             pubkey: ctx.identity.pubkey(),
-            signature: signature.to_vec(),
+            signature: ctx
+                .identity
+                .sign(&Message::launch_signing_payload(
+                    &plan_id,
+                    shard_index,
+                    program,
+                    &spec.artifact_hash,
+                    *from,
+                    *to,
+                    &next_addr,
+                    unix_ts,
+                ))
+                .to_vec(),
         };
-        if let Err(err) = send_msg(ctx, &slot.addr, &launch).await {
-            abort_plan(ctx, &plan_id, &shards, "launch failed").await;
-            bail!("cannot reach shard {}: {err:#}", slot.addr);
+        if let Err(err) = send_msg(ctx, &host.addr, &launch).await {
+            abort_plan(
+                ctx,
+                &plan_id,
+                &slots,
+                &format!("cannot reach shard host {}: {err:#}", host.addr),
+            )
+            .await;
+            bail!("cannot launch plan {plan_id}");
         }
     }
-
-    // Phase 1: wait for every shard to report ready.
-    let mut ready = HashSet::new();
-    let ready_deadline = tokio::time::sleep(READY_TIMEOUT);
-    tokio::pin!(ready_deadline);
-    while ready.len() < shards.len() {
-        tokio::select! {
-            event = events_rx.recv() => {
-                match event {
-                    Some(PlanEvent::Ready(index)) => { ready.insert(index); }
-                    Some(PlanEvent::Done(reason)) => {
-                        abort_plan(ctx, &plan_id, &shards, &reason).await;
-                        bail!("plan terminated during startup: {reason}");
-                    }
-                    Some(_) => {} // stray pipeline frames before startup
-                    None => {
-                        abort_plan(ctx, &plan_id, &shards, "plan channel closed").await;
-                        bail!("plan channel closed during startup");
-                    }
+    // Phase 1: readiness. The overall deadline bounds the whole phase;
+    // each event waits up to READY_TIMEOUT.
+    let started = Instant::now();
+    while plan_ready_count(ctx, &plan_id).await < ranges.len() {
+        let remaining = RUN_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            abort_plan(
+                ctx,
+                &plan_id,
+                &slots,
+                "plan timed out waiting for readiness",
+            )
+            .await;
+            bail!("plan {plan_id} timed out waiting for readiness");
+        }
+        let event = match tokio::time::timeout(READY_TIMEOUT.min(remaining), events_rx.recv()).await
+        {
+            Ok(Some(event)) => event,
+            _ => {
+                abort_plan(
+                    ctx,
+                    &plan_id,
+                    &slots,
+                    "plan timed out waiting for readiness",
+                )
+                .await;
+                bail!("plan {plan_id} timed out waiting for readiness");
+            }
+        };
+        match event {
+            PlanEvent::Ready(shard_index) => {
+                if let Some(plan) = ctx.swarm_plans.lock().await.get_mut(&plan_id) {
+                    plan.ready.insert(shard_index);
                 }
             }
-            _ = &mut ready_deadline => {
-                abort_plan(ctx, &plan_id, &shards, "startup timeout").await;
-                bail!("shards did not report ready within {READY_TIMEOUT:?}");
+            PlanEvent::Done(reason) => {
+                abort_plan(
+                    ctx,
+                    &plan_id,
+                    &slots,
+                    &format!("plan ended early: {reason}"),
+                )
+                .await;
+                bail!("plan {plan_id} ended early: {reason}");
             }
+            // Output or stray frames during readiness are ignored.
+            _ => {}
         }
     }
-
-    // Phase 2: inject the prompt into shard 0 and relay frames until the
-    // last shard reports completion.
-    let mut output = Vec::new();
-    let mut seq = 1u64;
-    let first = Message::ShardFwd {
-        plan_id: plan_id.clone(),
-        seq,
-        src: u32::MAX,
-        dst: 0,
-        payload: prompt,
-    };
-    seq += 1;
-    if let Err(err) = send_msg(ctx, &shards[0].addr, &first).await {
-        abort_plan(ctx, &plan_id, &shards, "pipeline start failed").await;
-        bail!("cannot inject prompt: {err:#}");
-    }
-    let run_deadline = tokio::time::sleep(RUN_TIMEOUT);
-    tokio::pin!(run_deadline);
+    // Phase 2: inject the prompt into shard 0 and relay/collect until
+    // completion, failure, or the deadline.
+    send_msg(
+        ctx,
+        &slots[0].addr,
+        &Message::ShardFwd {
+            plan_id: plan_id.clone(),
+            seq: 1,
+            src: u32::MAX,
+            dst: 0,
+            payload: prompt,
+        },
+    )
+    .await?;
+    let run_deadline = started + RUN_TIMEOUT;
+    let mut output: Vec<u8> = Vec::new();
     loop {
-        tokio::select! {
-            event = events_rx.recv() => match event {
-                Some(PlanEvent::Fwd { dst, payload, .. }) => {
-                    let frame = Message::ShardFwd {
-                        plan_id: plan_id.clone(),
-                        seq,
-                        src: u32::MAX,
-                        dst,
-                        payload,
-                    };
-                    seq += 1;
-                    match shards.get(dst as usize) {
-                        Some(slot) => {
-                            if let Err(err) = send_msg(ctx, &slot.addr, &frame).await {
-                                abort_plan(ctx, &plan_id, &shards, "pipeline relay failed").await;
-                                bail!("pipeline relay to shard {dst} failed: {err:#}");
-                            }
-                        }
-                        None => eprintln!("[swarm] frame for unknown shard {dst} dropped"),
-                    }
-                }
-                Some(PlanEvent::Out { payload, .. }) => output.extend_from_slice(&payload),
-                Some(PlanEvent::Done(reason)) => {
-                    broadcast_done(ctx, &plan_id, &shards, &reason).await;
-                    ctx.swarm_plans.lock().await.remove(&plan_id);
-                    break;
-                }
-                Some(PlanEvent::Ready(_)) => {}
-                None => {
-                    abort_plan(ctx, &plan_id, &shards, "plan channel closed").await;
-                    bail!("plan channel closed mid-run");
-                }
-            },
-            _ = &mut run_deadline => {
-                abort_plan(ctx, &plan_id, &shards, "run deadline").await;
-                bail!("plan exceeded {RUN_TIMEOUT:?}");
+        // `Instant` has no saturating subtraction: measure now and fall
+        // back to a zero duration once the deadline has passed.
+        let now = Instant::now();
+        let remaining = match run_deadline.checked_duration_since(now) {
+            Some(remaining) => remaining,
+            None => {
+                abort_plan(ctx, &plan_id, &slots, "plan exceeded its deadline").await;
+                bail!("plan {plan_id} exceeded its deadline");
             }
+        };
+        let event = match tokio::time::timeout(remaining, events_rx.recv()).await {
+            Ok(Some(event)) => event,
+            _ => {
+                abort_plan(ctx, &plan_id, &slots, "plan exceeded its deadline").await;
+                bail!("plan {plan_id} exceeded its deadline");
+            }
+        };
+        match event {
+            PlanEvent::Fwd { dst, payload, .. } => {
+                // Relay a pipeline frame to its shard host.
+                match slots.get(dst as usize) {
+                    Some(slot) => {
+                        let _ = send_msg(
+                            ctx,
+                            &slot.addr,
+                            &Message::ShardFwd {
+                                plan_id: plan_id.clone(),
+                                seq: 0,
+                                src: u32::MAX,
+                                dst,
+                                payload,
+                            },
+                        )
+                        .await;
+                    }
+                    None => eprintln!("[swarm] plan {plan_id}: stray frame for shard {dst}"),
+                }
+            }
+            PlanEvent::Out { payload, .. } => {
+                output.extend_from_slice(&payload);
+                if output.len() > OUTPUT_CAP {
+                    abort_plan(ctx, &plan_id, &slots, "plan exceeded the output cap").await;
+                    bail!("plan {plan_id} exceeded the output cap");
+                }
+            }
+            PlanEvent::Done(reason) => {
+                finish_plan(ctx, &plan_id, &reason).await;
+                if reason == "completed" {
+                    return Ok(String::from_utf8_lossy(&output).into_owned());
+                }
+                bail!("plan {plan_id} ended: {reason}");
+            }
+            PlanEvent::Ready(_) => {}
         }
     }
-    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
-/// Send `SwarmDone` to every shard of the plan.
-async fn broadcast_done(ctx: &Arc<Ctx>, plan_id: &str, shards: &[ShardSlot], reason: &str) {
-    for slot in shards {
-        let _ = send_msg(
-            ctx,
-            &slot.addr,
-            &Message::SwarmDone {
-                plan_id: plan_id.to_string(),
-                reason: reason.to_string(),
-            },
-        )
-        .await;
+/// Current number of ready shards recorded in the plan state.
+async fn plan_ready_count(ctx: &Arc<Ctx>, plan_id: &str) -> usize {
+    ctx.swarm_plans
+        .lock()
+        .await
+        .get(plan_id)
+        .map(|plan| plan.ready.len())
+        .unwrap_or(0)
+}
+
+/// End the plan locally and tell every shard host to tear down.
+async fn abort_plan(ctx: &Arc<Ctx>, plan_id: &str, slots: &[ShardSlot], reason: &str) {
+    finish_plan(ctx, plan_id, reason).await;
+    broadcast_done(ctx, plan_id, slots, reason).await;
+}
+
+/// Send `SwarmDone` to every shard host that is not this node.
+async fn broadcast_done(ctx: &Arc<Ctx>, plan_id: &str, slots: &[ShardSlot], reason: &str) {
+    let local = ctx.transport.local_id();
+    for slot in slots {
+        if slot.addr != local {
+            let _ = send_msg(
+                ctx,
+                &slot.addr,
+                &Message::SwarmDone {
+                    plan_id: plan_id.to_string(),
+                    reason: reason.to_string(),
+                },
+            )
+            .await;
+        }
     }
 }
 
-/// Abort helper: notify all shards and drop local plan state.
-async fn abort_plan(ctx: &Arc<Ctx>, plan_id: &str, shards: &[ShardSlot], reason: &str) {
-    broadcast_done(ctx, plan_id, shards, reason).await;
-    ctx.swarm_plans.lock().await.remove(plan_id);
+/// Split `layers` across capacity slots proportionally to `caps`. Zero
+/// slots and slots whose rounded share cannot hold a single layer are
+/// skipped — they never absorb part of the layer space. The last
+/// contributing slot takes the remainder so the union of ranges always
+/// covers `[0, layers)` exactly.
+pub(crate) fn split_layers(layers: u32, caps: &[u64]) -> Vec<(u32, u32)> {
+    let total: u64 = caps.iter().sum();
+    let last_contributing = caps.iter().rposition(|cap| *cap > 0);
+    let mut out = Vec::new();
+    let mut from = 0u32;
+    for (index, cap) in caps.iter().enumerate() {
+        if from >= layers || *cap == 0 {
+            continue;
+        }
+        let to = if Some(index) == last_contributing {
+            layers
+        } else {
+            let share = ((*cap as f64 / total.max(1) as f64) * layers as f64).round() as u32;
+            if share == 0 {
+                continue;
+            }
+            (from + share).clamp(from + 1, layers)
+        };
+        out.push((from, to));
+        from = to;
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::split_layers;
 
     #[test]
-    fn split_layers_covers_the_whole_range() {
-        let ranges = split_layers(10, &[100, 50]);
-        assert_eq!(ranges, vec![(0, 7), (7, 10)]);
-        let ranges = split_layers(3, &[1, 1, 1]);
-        assert_eq!(ranges, vec![(0, 1), (1, 2), (2, 3)]);
+    fn proportional_split() {
+        assert_eq!(split_layers(10, &[100, 50]), vec![(0, 7), (7, 10)]);
     }
 
     #[test]
-    fn split_layers_skips_zero_caps() {
-        let ranges = split_layers(4, &[0, 10, 0]);
-        assert_eq!(ranges, vec![(0, 4)]);
-    }
-
-    #[test]
-    fn split_layers_handles_single_shard() {
+    fn single_shard_takes_all() {
         assert_eq!(split_layers(5, &[7]), vec![(0, 5)]);
+    }
+
+    #[test]
+    fn zero_capacity_slots_are_skipped() {
+        assert_eq!(split_layers(4, &[0, 10, 0]), vec![(0, 4)]);
+        assert_eq!(split_layers(10, &[50, 0, 50]), vec![(0, 5), (5, 10)]);
+    }
+
+    #[test]
+    fn all_zero_pool_places_nothing() {
+        // With no capacity anywhere there is no placement at all; the
+        // coordinator rejects the plan before launching.
+        assert!(split_layers(3, &[0, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn ranges_cover_the_layer_space() {
+        let ranges = split_layers(3, &[1, 1, 1]);
+        assert_eq!(ranges.first().map(|range| range.0), Some(0));
+        assert_eq!(ranges.last().map(|range| range.1), Some(3));
+        for (from, to) in &ranges {
+            assert!(from < to, "empty range in {ranges:?}");
+        }
     }
 }

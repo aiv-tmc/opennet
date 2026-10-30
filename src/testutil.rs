@@ -3,9 +3,16 @@
 //! module.
 //!
 //! Scratch directories are unique per test run (a process-wide random
-//! suffix generated once) and per calling thread, so test artifacts never
-//! leak between `cargo test` invocations or between parallel tests, while
-//! repeated calls from one test still hit the same directory.
+//! suffix generated once) and per calling thread, so test artifacts
+//! never leak between `cargo test` invocations or between parallel
+//! tests, while repeated calls from one test still hit the same
+//! directory.
+//!
+//! The execution sandbox is disabled in test contexts: namespace
+//! creation depends on host privileges and outer container runtimes,
+//! which may reap nested-namespace children and make task outcomes
+//! nondeterministic. The real sandbox is exercised explicitly by the
+//! gated test in `compute::executor::tests` (set `OPENNET_SANDBOX_TEST=1`).
 
 use crate::compute::provider::Cmd;
 use crate::compute::ComputeEvent;
@@ -42,6 +49,14 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("opennet-test-{tag}-{thread}-{}", run_suffix()))
 }
 
+/// Whether the gated sandbox-isolation test was requested for this run.
+/// When set, test contexts keep the real sandbox defaults and the
+/// isolation assertions execute; otherwise every unit test runs with
+/// the sandbox disabled for determinism.
+pub fn sandbox_test_requested() -> bool {
+    std::env::var_os("OPENNET_SANDBOX_TEST").is_some()
+}
+
 /// Build a daemon context backed by a loopback transport and a scratch
 /// state directory; the returned receiver is the compute scheduler's
 /// command channel, which tests may drain or ignore.
@@ -51,6 +66,15 @@ pub async fn make_ctx(tag: &str) -> (Arc<Ctx>, mpsc::Receiver<Cmd>) {
     let mut config = Config::default();
     config.paths.state_dir = dir.clone();
     config.paths.socket_path = dir.join("control.sock");
+    if !sandbox_test_requested() {
+        // Unit tests must be deterministic on any host: real namespace
+        // and cgroup isolation depends on privileges the test machine
+        // may or may not grant, and on outer runtimes that may reap
+        // nested-namespace children. The sandbox is verified explicitly
+        // by the gated isolation test instead.
+        config.sandbox.namespaces = false;
+        config.sandbox.cgroup = false;
+    }
     let transport = Arc::new(
         Transport::new(0, Duration::from_secs(60))
             .await

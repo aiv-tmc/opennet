@@ -74,7 +74,12 @@ async fn execute(ctx: &Arc<Ctx>, launch: Launch) {
         // Give the task its own process group so the timeout path can kill
         // the whole tree, including grandchildren the shell may spawn.
         .process_group(0);
-    sandbox::apply_to_command(&mut command, &workdir, &ctx.config.sandbox);
+    sandbox::apply_to_command(
+        &mut command,
+        &workdir,
+        &ctx.config.sandbox,
+        ctx.config.limits.ram_mb,
+    );
 
     let mut child = match command.spawn() {
         Ok(child) => child,

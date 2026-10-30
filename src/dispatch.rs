@@ -124,7 +124,7 @@ pub(crate) async fn handle_frame(ctx: &Arc<Ctx>, src: &str, data: &[u8]) {
             compute::deliver_event(ctx, &task_id, ComputeEvent::Outcome(outcome)).await;
         }
         Some(launch @ Message::ShardLaunch { .. }) => {
-            swarm::handle_launch(ctx, src, launch).await;
+            let _ = swarm::handle_launch(ctx, src, launch).await;
         }
         Some(Message::ShardFwd {
             plan_id,

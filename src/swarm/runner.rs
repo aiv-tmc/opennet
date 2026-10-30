@@ -1,91 +1,88 @@
-//! Runner bridge: the local plumbing between one shard process and the
-//! network.
+//! The runner bridge: the worker side of the local runner protocol.
 //!
-//! The worker spawns the manifest's runner command with the shard
-//! environment exported; the runner connects to the worker's local
-//! listener and speaks a minimal length-prefixed frame protocol:
+//! The bridge owns the loopback socket between the daemon and one shard
+//! runner process. It serves three flows until the runner exits, the
+//! plan ends, or the socket breaks:
 //!
-//! ```text
-//! worker -> runner : [u32 len][payload]            pipeline input
-//! runner -> worker : [u32 len][u8 tag][payload]    one of:
-//!     tag 1: forward `payload` to the next shard (ShardFwd)
-//!     tag 2: deliver `payload` to the coordinator (ShardOut)
-//!     tag 3: report readiness (ShardReady)
-//!     tag 4: report completion (SwarmDone)
-//! ```
+//! * worker → runner: length-tagged frames (tag 0) drained from the
+//!   shard's bounded inbound queue;
+//! * runner → worker: tagged frames — tag 1 forwards an activation to
+//!   the next shard host (an empty next address means the last shard,
+//!   which must not forward), tag 2 delivers output to the coordinator,
+//!   tag 3 reports readiness (once), tag 4 reports plan completion;
+//! * shutdown: `finish_plan` fires the oneshot; the bridge kills the
+//!   whole process group, reaps the child, removes the scratch
+//!   directory and unregisters the bridge.
 //!
-//! Any program implementing these frames can serve as a shard runner, from
-//! a small LLM-inference wrapper to a generic map-reduce worker. The
-//! bridge owns the child process: on shutdown, plan end or runner exit it
-//! kills the whole process group, reaps the child, cleans the working
-//! directory and deregisters the shard.
+//! Reads carry no inter-frame timeout: a shard may sit idle between
+//! pipeline activations for the whole plan lifetime. Liveness is
+//! bounded by the plan deadline on the coordinator side and by the
+//! socket closing when the runner dies.
 
-use crate::daemon::send_msg;
-use crate::daemon::Ctx;
+use crate::daemon::{send_msg, Ctx};
 use crate::message::Message;
+use crate::transport::MAX_FRAME;
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 
-/// Frame header size on the local runner socket.
-const HEADER: usize = 4;
-/// Deadline for one runner-side frame before the shard is considered dead.
-const FRAME_TIMEOUT: Duration = Duration::from_secs(300);
+/// Tag values of the runner → worker protocol.
+const TAG_FWD: u8 = 1;
+const TAG_OUT: u8 = 2;
+const TAG_READY: u8 = 3;
+const TAG_DONE: u8 = 4;
 
-/// Relay frames between the runner socket, the network and the local
-/// inbound queue until shutdown, runner exit or completion, then kill the
-/// runner process group, reap the child, remove the working directory and
-/// deregister the shard.
+/// Serve one runner until completion or teardown, then clean up.
 #[allow(clippy::too_many_arguments)]
 pub async fn bridge(
     ctx: Arc<Ctx>,
     plan_id: String,
     shard_index: u32,
     mut socket: TcpStream,
-    mut inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut inbound: mpsc::Receiver<Vec<u8>>,
     mut shutdown: oneshot::Receiver<()>,
     pid: i32,
     mut child: Child,
+    workdir: PathBuf,
     next_addr: String,
     coord_addr: String,
 ) {
-    let mut seq = 1u64;
+    let mut ready_sent = false;
+    let mut seq: u64 = 0;
     loop {
         tokio::select! {
-            // Plan end or consent revocation: stop relaying.
+            // Plan ended elsewhere: tear the runner down.
             _ = &mut shutdown => break,
-            // A pipeline payload arrived from the network; hand it to the
-            // runner as a plain length-prefixed frame.
-            payload = inbound.recv() => {
-                let Some(payload) = payload else { break };
-                if let Err(err) = write_frame(&mut socket, 0, &payload).await {
-                    eprintln!("[swarm] runner socket write failed: {err:#}");
+            // Every inbound sender is gone (plan state dropped): the
+            // queue will never receive pipeline frames again.
+            frame = inbound.recv() => {
+                let Some(payload) = frame else {
+                    break;
+                };
+                if write_frame(&mut socket, 0, &payload).await.is_err() {
                     break;
                 }
             }
-            // One frame from the runner.
-            frame = read_frame(&mut socket) => {
-                let (tag, payload) = match frame {
-                    Ok(frame) => frame,
-                    Err(err) => {
-                        eprintln!("[swarm] runner socket closed: {err:#}");
-                        break;
-                    }
+            // One tagged frame from the runner. EOF and protocol errors
+            // both end the loop; the cleanup below reaps the child.
+            tagged = read_frame(&mut socket) => {
+                let Some((tag, payload)) = tagged else {
+                    break;
                 };
                 match tag {
-                    1 => {
-                        // Forward the payload along the pipeline; without a
-                        // next shard the program contract is violated.
+                    TAG_FWD => {
                         if next_addr.is_empty() {
-                            eprintln!(
-                                "[swarm] shard {shard_index} tried to forward past the last shard"
-                            );
+                            // The last shard has nowhere to forward; a
+                            // tag-1 frame here is a contract violation
+                            // by the runner, not a pipeline step.
+                            eprintln!("[swarm] last shard tried to forward");
                             continue;
                         }
+                        seq += 1;
                         let _ = send_msg(
                             &ctx,
                             &next_addr,
@@ -98,9 +95,9 @@ pub async fn bridge(
                             },
                         )
                         .await;
-                        seq += 1;
                     }
-                    2 => {
+                    TAG_OUT => {
+                        seq += 1;
                         let _ = send_msg(
                             &ctx,
                             &coord_addr,
@@ -111,9 +108,12 @@ pub async fn bridge(
                             },
                         )
                         .await;
-                        seq += 1;
                     }
-                    3 => {
+                    TAG_READY if !ready_sent => {
+                        // Reported once; duplicates are ignored so a
+                        // chatty runner cannot advance the coordinator's
+                        // phase logic.
+                        ready_sent = true;
                         let _ = send_msg(
                             &ctx,
                             &coord_addr,
@@ -124,69 +124,63 @@ pub async fn bridge(
                         )
                         .await;
                     }
-                    4 => {
+                    TAG_DONE => {
                         let _ = send_msg(
                             &ctx,
                             &coord_addr,
                             &Message::SwarmDone {
                                 plan_id: plan_id.clone(),
-                                reason: "shard complete".to_string(),
+                                reason: "completed".to_string(),
                             },
                         )
                         .await;
                         break;
                     }
-                    other => eprintln!("[swarm] runner sent unknown tag {other}"),
+                    // Unknown tags are reserved for future extensions.
+                    _ => {}
                 }
             }
         }
     }
-    // SAFETY: the pid belongs to the process group created for the runner
-    // by the shard worker; the daemon lives in a different group.
+    // SAFETY: `pid` is the child's own process group id (created with
+    // `process_group(0)`); the daemon lives in a different group and can
+    // never signal itself.
     unsafe { libc::killpg(pid, libc::SIGKILL) };
     let _ = child.wait().await;
-    let workdir = std::env::temp_dir().join(format!(
-        "opennet-swarm-{}-{shard_index}",
-        &plan_id[..plan_id.len().min(16)]
-    ));
-    let _ = tokio::fs::remove_dir_all(&workdir).await;
+    let _ = std::fs::remove_dir_all(&workdir);
     ctx.swarm_procs
         .lock()
         .await
-        .remove(&format!("{plan_id}:{shard_index}"));
+        .remove(&crate::swarm::proc_key(&plan_id, shard_index));
 }
 
-/// Read one `[u32 len][u8 tag][payload]` frame from the runner socket
-/// under the per-frame deadline.
-async fn read_frame(socket: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
-    let raw = tokio::time::timeout(FRAME_TIMEOUT, read_raw(socket)).await??;
-    let Some((&tag, payload)) = raw.split_first() else {
-        anyhow::bail!("empty runner frame");
-    };
-    Ok((tag, payload.to_vec()))
-}
-
-/// Write one `[u32 len][u8 tag][payload]` frame to the runner socket.
+/// Write one worker → runner frame: u32 length (tag byte included), u8
+/// tag, payload, in a single buffer so the loopback write stays atomic.
 async fn write_frame(socket: &mut TcpStream, tag: u8, payload: &[u8]) -> Result<()> {
-    let mut buf = Vec::with_capacity(payload.len() + 1 + HEADER);
-    buf.extend_from_slice(&((payload.len() + 1) as u32).to_be_bytes());
-    buf.push(tag);
-    buf.extend_from_slice(payload);
-    socket.write_all(&buf).await?;
+    let mut framed = Vec::with_capacity(5 + payload.len());
+    framed.extend_from_slice(&((payload.len() + 1) as u32).to_be_bytes());
+    framed.push(tag);
+    framed.extend_from_slice(payload);
+    socket.write_all(&framed).await?;
     Ok(())
 }
 
-/// Read one length-prefixed byte blob from the runner socket.
-async fn read_raw(socket: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; HEADER];
-    socket.read_exact(&mut len_buf).await?;
+/// Read one runner → worker tagged frame: u32 length (tag byte included),
+/// u8 tag, payload. Returns `None` on EOF or protocol violation; lengths
+/// are capped at the wire frame limit so the local protocol never
+/// exceeds what the transport accepts.
+async fn read_frame(socket: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+    let mut len_buf = [0u8; 4];
+    socket.read_exact(&mut len_buf).await.ok()?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len == 0 || len > 64 * 1024 * 1024 {
-        anyhow::bail!("runner frame of invalid size {len}");
+    if len == 0 || len > MAX_FRAME {
+        eprintln!("[swarm] runner frame length {len} outside 1..={MAX_FRAME}");
+        return None;
     }
-    let mut data = vec![0u8; len];
-    socket.read_exact(&mut data).await?;
-    Ok(data)
+    let mut body = vec![0u8; len];
+    socket.read_exact(&mut body).await.ok()?;
+    let tag = body[0];
+    Some((tag, body.split_off(1)))
 }
 
 #[cfg(test)]
@@ -194,21 +188,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn frame_roundtrip_over_a_local_socket() {
+    async fn frame_roundtrip() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = tokio::spawn(async move {
-            let mut stream = TcpStream::connect(addr).await.unwrap();
-            write_frame(&mut stream, 3, b"ready").await.unwrap();
-            let (tag, payload) = read_frame(&mut stream).await.unwrap();
-            assert_eq!(tag, 0);
-            assert_eq!(payload, b"input".to_vec());
-        });
+        let port = listener.local_addr().unwrap().port();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let (mut server, _) = listener.accept().await.unwrap();
+        write_frame(&mut client, 7, b"hello").await.unwrap();
         let (tag, payload) = read_frame(&mut server).await.unwrap();
-        assert_eq!(tag, 3);
-        assert_eq!(payload, b"ready".to_vec());
-        write_frame(&mut server, 0, b"input").await.unwrap();
-        client.await.unwrap();
+        assert_eq!(tag, 7);
+        assert_eq!(payload, b"hello");
     }
 }

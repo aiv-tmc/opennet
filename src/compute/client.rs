@@ -1,10 +1,16 @@
 //! Consumer side of the compute market: reserve trust units, bid with a
-//! signed trust snapshot, assign the signed command, settle the reservation
-//! by actual billed time and return the rendered result.
+//! signed trust snapshot, assign the signed command, settle the
+//! reservation by actual billed time and return the rendered result.
+//!
+//! Billing honesty bound: the reported billed seconds are capped by the
+//! wall time actually observed between the accept and the outcome plus a
+//! small slack, so a provider cannot charge for more seconds than the
+//! task could possibly have run; honest providers measure billed time the
+//! same way locally, so the cap only bites when clocks skew or a provider
+//! lies. The charge is additionally capped by the reservation.
 //!
 //! All trust accounting happens under the single state lock through
-//! `NodeState::reserve` / `release` / `settle`, so no secondary lock is
-//! ever taken while holding it.
+//! `NodeState::reserve` / `release` / `settle`.
 
 use crate::compute::policy::announced_points;
 use crate::compute::{ComputeEvent, TaskOutcome};
@@ -14,15 +20,20 @@ use crate::message::Message;
 use crate::node::state::Mode;
 use crate::trust::{now_unix, points::units_for};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 /// How long to wait for the bid decision before giving up.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Extra seconds of billing slack beyond the measured elapsed time
+/// before a provider's reported duration is cut; LAN clocks may skew by a
+/// few seconds, so the cap must not bite honest providers.
+const BILLING_SLACK_SECS: u64 = 5;
 
-/// Run `command` on a peer and charge trust units for it. `prefix` selects
-/// a peer by node id; `None` lets the client pick the most suitable known
-/// peer automatically. The result is returned as control-socket text.
+/// Run `command` on a peer and charge trust units for it. `prefix`
+/// selects a peer by node id; `None` lets the client pick the most
+/// suitable known peer automatically. The result is returned as
+/// control-socket text.
 pub async fn compute(
     ctx: &Arc<Ctx>,
     prefix: Option<&str>,
@@ -39,9 +50,8 @@ pub async fn compute(
     let Some(peer) = peer else {
         return "error: no suitable peer known\n".to_string();
     };
-    // Both sides price the reservation from the provider's announced points
-    // and the agreed limit; the final charge follows the billed seconds
-    // reported in the outcome.
+    // Both sides price the reservation from the provider's announced
+    // points; the final charge follows the billed seconds.
     let points = {
         let dht = ctx.dht.lock().await;
         announced_points(&dht, &peer.node_id)
@@ -53,12 +63,10 @@ pub async fn compute(
         );
     };
     let max_units = units_for(points, timeout_secs);
-
     let task_id = format!("{:016x}", rand::random::<u64>());
-    let floor = ctx.config.trust.min_trust;
     {
         let mut state = ctx.state.lock().await;
-        if let Err(err) = state.reserve(&task_id, max_units, floor) {
+        if let Err(err) = state.reserve(&task_id, max_units, ctx.config.trust.min_trust) {
             return format!("error: {err}\n");
         }
     }
@@ -67,7 +75,6 @@ pub async fn compute(
         .lock()
         .await
         .insert(task_id.clone(), events_tx);
-
     // Sign the post-reservation trust snapshot so the provider can verify
     // the claim against the last announced value.
     let bid = {
@@ -89,7 +96,6 @@ pub async fn compute(
         ctx.state.lock().await.release(&task_id);
         return format!("error: cannot reach peer: {err:#}\n");
     }
-
     // Wait for the bid decision before assigning real work.
     match tokio::time::timeout(REPLY_TIMEOUT, &mut events_rx).await {
         Ok(Ok(ComputeEvent::Accepted)) => {}
@@ -104,18 +110,16 @@ pub async fn compute(
             return "error: peer did not answer the bid, reservation released\n".to_string();
         }
     }
-
     // The bid reply consumed the first one-shot waiter; arm a fresh one
-    // for the outcome phase before handing the work to the provider, so a
-    // result arriving during the handover can never be lost.
+    // for the outcome phase before handing the work to the provider.
     let (outcome_tx, outcome_rx) = oneshot::channel::<ComputeEvent>();
     ctx.result_waiters
         .lock()
         .await
         .insert(task_id.clone(), outcome_tx);
-
-    // The assignment is signed by the same key that made the bid; the
-    // provider launches only assignments that match an accepted bid.
+    // Billing reference point: the accept moment.
+    let started = Instant::now();
+    // The assignment is signed by the same key that made the bid.
     let assign = {
         let payload = Message::assign_signing_payload(&task_id, &command, timeout_secs);
         Message::TaskAssign {
@@ -131,7 +135,6 @@ pub async fn compute(
         ctx.state.lock().await.release(&task_id);
         return format!("error: cannot assign task: {err:#}\n");
     }
-
     let grace = Duration::from_secs(timeout_secs + 60);
     let outcome = match tokio::time::timeout(grace, outcome_rx).await {
         Ok(Ok(ComputeEvent::Outcome(outcome))) => outcome,
@@ -141,10 +144,15 @@ pub async fn compute(
         }
     };
     ctx.result_waiters.lock().await.remove(&task_id);
-
-    // The task consumed real capacity: charge the actual billed time and
-    // return the unused part of the reservation to the coefficient.
-    let charge = units_for(points, outcome.billed_secs).min(max_units);
+    // Billing honesty bound: the provider cannot have used more seconds
+    // than actually passed, plus a small transport slack; the task
+    // timeout is the absolute ceiling.
+    let elapsed = started.elapsed().as_secs();
+    let billed_secs = outcome
+        .billed_secs
+        .min(elapsed + BILLING_SLACK_SECS)
+        .min(timeout_secs);
+    let charge = units_for(points, billed_secs).min(max_units);
     let header = {
         let mut state = ctx.state.lock().await;
         state.settle(&task_id, charge);
@@ -157,8 +165,7 @@ pub async fn compute(
 }
 
 /// Choose the peer most likely to serve well: seeds first, then the
-/// highest-trust peers, with the reputation score and freshness as
-/// tiebreakers.
+/// highest-trust peers, with reputation and freshness as tiebreakers.
 async fn auto_pick(ctx: &Arc<Ctx>) -> Option<PeerInfo> {
     let mut candidates: Vec<PeerInfo> = ctx
         .dht
@@ -185,8 +192,7 @@ async fn auto_pick(ctx: &Arc<Ctx>) -> Option<PeerInfo> {
     candidates.into_iter().next()
 }
 
-/// Format the finished task for the control socket, keeping the settlement
-/// header that the settlement step produced.
+/// Format the finished task for the control socket.
 fn render(header: &str, outcome: &TaskOutcome) -> String {
     format!(
         "{header}exit_code: {code}\nstdout:\n{stdout}\nstderr:\n{stderr}\n",
