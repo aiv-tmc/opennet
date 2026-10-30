@@ -153,9 +153,10 @@ impl NodeState {
         }
         // Saturating: a corrupt legacy reservation map must never wrap
         // the coefficient below its floor through plain addition.
-        let refunded: i64 = reservations.values().copied().fold(0i64, |acc, units| {
-            acc.saturating_add(units)
-        });
+        let refunded: i64 = reservations
+            .values()
+            .copied()
+            .fold(0i64, |acc, units| acc.saturating_add(units));
         if refunded != 0 {
             trust = trust.saturating_add(refunded);
             reservations.clear();
