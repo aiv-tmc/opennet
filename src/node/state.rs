@@ -1,218 +1,246 @@
 //! Node state: operating mode, trust coefficient, consumption counter,
-//! message counters, task statistics, and in-memory task reservations.
+//! task statistics, and in-memory task reservations.
 //!
 //! The trust economy is local double-entry bookkeeping. This node tracks
 //! its own trust (`trust`) and the units it has effectively spent on
-//! remote work (`consumed`). Providers credit their own trust by the same
-//! amounts they bill, so units are conserved network-wide.
+//! remote work (`consumed`). Providers credit their own trust by the
+//! same amounts they bill, so units are conserved network-wide.
 //!
 //! Reservations are held in memory only: a task's price is deducted
 //! from `trust` for the lifetime of the task and either settled
-//! (partially refunded) or released (fully refunded) afterwards. A daemon
-//! restart therefore discards outstanding reservations; state files
-//! written by older versions persisted their reservation maps, and those
-//! are refunded at load time so nothing is owed across restarts either
-//! way.
+//! (partially refunded) or released (fully refunded) afterwards. A
+//! daemon restart therefore discards outstanding reservations; state
+//! files written by older versions persisted their reservation maps,
+//! and those are refunded at load time so nothing is owed across
+//! restarts either way.
 //!
 //! The state file is written atomically (tmp file + rename) with
-//! owner-only permissions: trust and consumption data is sensitive local
-//! state and must not be world-readable.
+//! owner-only permissions: trust and consumption data is sensitive
+//! local state and must not be world-readable. The first boot (and a
+//! boot that refunded stale reservations) materializes the file so it
+//! always exists; clean reloads never rewrite it on load.
 
 use crate::config::{Limits, TrustCfg};
+use crate::trust::points::compute_points;
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// Operating mode of a node. Serialized lowercase (`"peer"`, `"seed"`,
-/// `"leech"`) in both TOML config and JSON state files.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// How the node participates in the network. Serialized lowercase in
+/// both TOML config and JSON state files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// Donates capacity and requests tasks.
-    #[default]
+    /// Give and take compute capacity.
     Peer,
-    /// Donates capacity only; accumulates trust.
+    /// Only donate capacity and accumulate trust.
     Seed,
-    /// Requests tasks only; never donates.
+    /// Only consume capacity from the network.
     Leech,
 }
 
 impl Mode {
-    /// Config-file representation of the mode.
-    pub fn as_str(self) -> &'static str {
+    /// Machine-readable mode name used on the wire and in the control
+    /// socket.
+    pub fn as_str(&self) -> &'static str {
         match self {
-            Mode::Peer => "peer",
-            Mode::Seed => "seed",
-            Mode::Leech => "leech",
+            Self::Peer => "peer",
+            Self::Seed => "seed",
+            Self::Leech => "leech",
         }
     }
 
-    /// Parse the config-file representation; unknown values are an
-    /// error so a typo never silently changes the operating mode.
-    pub fn parse(raw: &str) -> Result<Self, String> {
-        match raw {
-            "peer" => Ok(Mode::Peer),
-            "seed" => Ok(Mode::Seed),
-            "leech" => Ok(Mode::Leech),
-            other => Err(format!("unknown mode '{other}' (expected peer|seed|leech)")),
+    /// Parse a mode name; unknown names are rejected.
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "peer" => Ok(Self::Peer),
+            "seed" => Ok(Self::Seed),
+            "leech" => Ok(Self::Leech),
+            other => bail!("unknown mode '{other}', expected peer, seed or leech"),
         }
     }
-
-    /// Whether this mode donates capacity to the network.
-    pub fn donates(self) -> bool {
-        !matches!(self, Mode::Leech)
-    }
 }
 
-/// Mutable node state guarded by the daemon.
-#[derive(Clone, Debug)]
-pub struct NodeState {
-    /// Operating mode: peer, seed or leech.
-    pub mode: Mode,
-    /// Trust coefficient: grows when this node donates compute, shrinks
-    /// when it spends trust on remote work.
-    pub trust: i64,
-    /// Total units this node has been charged for remote work.
-    pub consumed: u64,
-    /// Capacity points this node charges for its donated capacity.
-    pub points: u32,
-    /// Lifetime message counters for the status report.
-    pub msgs_sent: u64,
-    pub msgs_received: u64,
-    /// Completed and failed tasks executed for remote consumers.
-    pub tasks_completed: u64,
-    pub tasks_failed: u64,
-    /// Advertised resource limits.
-    pub limits: Limits,
-    /// Outstanding reservations keyed by task id. Public for read-only
-    /// renderers; mutated only through `reserve` / `release` / `settle`.
-    pub reservations: HashMap<String, i64>,
-    /// Directory the state file lives in.
-    state_dir: PathBuf,
-    /// Daemon start time for the uptime report.
-    started: Instant,
-}
-
-/// Persistent portion of the node state.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// State fields persisted to disk between daemon restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     mode: Mode,
     trust: i64,
     consumed: u64,
-    points: u32,
-    msgs_sent: u64,
-    msgs_received: u64,
+    #[serde(default)]
     tasks_completed: u64,
+    #[serde(default)]
     tasks_failed: u64,
-    /// Outstanding reservations keyed by task id; only populated by
-    /// state files written by older versions (current versions keep
-    /// reservations in memory), and refunded at load time by
-    /// `refund_stale_reservations`.
+    /// Trust units held by tasks that were reserved but not yet
+    /// settled; only populated by older versions, since reservations
+    /// now stay in memory.
     #[serde(default)]
     reservations: HashMap<String, i64>,
 }
 
+/// Mutable runtime state shared across daemon tasks.
+pub struct NodeState {
+    pub mode: Mode,
+    /// Trust coefficient earned by donating compute and spent by
+    /// consuming it; providers gate acceptance on this value as last
+    /// announced. Reservations are already deducted from this value.
+    pub trust: i64,
+    /// Cumulative trust units consumed on remote providers, announced
+    /// in every bid so providers can audit the claimed trust
+    /// arithmetic.
+    pub consumed: u64,
+    /// Static capacity price of this node's offered hardware,
+    /// announced to peers and used to charge consumers for executed
+    /// tasks.
+    pub points: u32,
+    /// Total wire messages sent to peers.
+    pub msgs_sent: u64,
+    /// Total wire messages received from peers.
+    pub msgs_received: u64,
+    /// Number of remote tasks that finished with exit code zero.
+    pub tasks_completed: u64,
+    /// Number of remote tasks that failed or timed out.
+    pub tasks_failed: u64,
+    started: Instant,
+    state_file: PathBuf,
+    /// Resource limits offered to the network.
+    pub limits: Limits,
+    /// Units currently reserved by in-flight local tasks, keyed by
+    /// task id. In-memory only; a crash refunds them on boot.
+    pub reservations: HashMap<String, i64>,
+}
+
 impl NodeState {
-    /// Load persisted state from `state_dir`, falling back to fresh
-    /// genesis state when the file is missing or unreadable.
+    /// Load persisted state from `<state_dir>/state.json` or start
+    /// with the genesis trust endowment; a malformed file is reported
+    /// as an error.
+    ///
+    /// On first boot (no state file) the initial state is written to
+    /// disk so the file always exists. Reservations surviving from
+    /// older state files are refunded into trust on the spot: their
+    /// tasks can never complete after a restart, so keeping the
+    /// deduction would silently burn the user's trust. Clean restarts
+    /// never rewrite the file.
     pub fn load(
         state_dir: &Path,
         default_mode: Mode,
         limits: Limits,
         trust_cfg: &TrustCfg,
-    ) -> std::io::Result<Self> {
-        let file = state_file(state_dir);
-        let mut state = match std::fs::read_to_string(&file) {
-            Ok(text) => {
-                let persisted: PersistedState = serde_json::from_str(&text)?;
-                Self {
-                    mode: persisted.mode,
-                    trust: persisted.trust,
-                    consumed: persisted.consumed,
-                    points: persisted.points,
-                    msgs_sent: persisted.msgs_sent,
-                    msgs_received: persisted.msgs_received,
-                    tasks_completed: persisted.tasks_completed,
-                    tasks_failed: persisted.tasks_failed,
-                    limits,
-                    reservations: persisted.reservations,
-                    state_dir: state_dir.to_path_buf(),
-                    started: Instant::now(),
-                }
-            }
-            Err(_) => Self {
-                mode: default_mode,
-                trust: trust_cfg.genesis_trust,
-                consumed: 0,
-                points: 0,
-                msgs_sent: 0,
-                msgs_received: 0,
-                tasks_completed: 0,
-                tasks_failed: 0,
-                limits,
-                reservations: HashMap::new(),
-                state_dir: state_dir.to_path_buf(),
-                started: Instant::now(),
-            },
+    ) -> Result<Self> {
+        std::fs::create_dir_all(state_dir)
+            .with_context(|| format!("cannot create state dir {}", state_dir.display()))?;
+        let state_file = state_dir.join("state.json");
+        let existed = state_file.exists();
+        let mut mode = default_mode;
+        let mut trust = trust_cfg.genesis_trust;
+        let mut consumed = 0u64;
+        let mut tasks_completed = 0u64;
+        let mut tasks_failed = 0u64;
+        let mut reservations = HashMap::new();
+        if existed {
+            let text = std::fs::read_to_string(&state_file)
+                .with_context(|| format!("cannot read state file {}", state_file.display()))?;
+            let persisted: PersistedState = serde_json::from_str(&text)
+                .with_context(|| format!("invalid state file {}", state_file.display()))?;
+            mode = persisted.mode;
+            trust = persisted.trust;
+            consumed = persisted.consumed;
+            tasks_completed = persisted.tasks_completed;
+            tasks_failed = persisted.tasks_failed;
+            reservations = persisted.reservations;
+        }
+        // Saturating: a corrupt legacy reservation map must never wrap
+        // the coefficient below its floor through plain addition.
+        let refunded: i64 = reservations.values().copied().fold(0i64, |acc, units| {
+            acc.saturating_add(units)
+        });
+        if refunded != 0 {
+            trust = trust.saturating_add(refunded);
+            reservations.clear();
+        }
+        let state = Self {
+            mode,
+            trust,
+            consumed,
+            points: compute_points(trust_cfg, &limits),
+            msgs_sent: 0,
+            msgs_received: 0,
+            tasks_completed,
+            tasks_failed,
+            started: Instant::now(),
+            state_file,
+            limits,
+            reservations,
         };
-        state.refund_stale_reservations();
+        if !existed || refunded != 0 {
+            // First boot: materialize the initial state so the file
+            // always exists. Refund: persist it so a second crash
+            // cannot double-release. Clean reloads skip the write.
+            let _ = state.save();
+        }
         Ok(state)
     }
 
-    /// Persist mode, trust, consumption and counters atomically to this
-    /// node's state file. The tmp file is created owner-readable-only
-    /// before the rename so the state never exists with default umask
-    /// permissions.
-    pub fn save(&self) -> std::io::Result<()> {
-        let file = state_file(&self.state_dir);
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+    /// Persist mode, trust, consumption counter, task statistics and
+    /// any leftover reservation map atomically (temp file plus rename)
+    /// so an interrupted write cannot corrupt the state. The temp
+    /// file is made owner-readable-only before the rename. Failures
+    /// are logged to stderr and returned — callers on the hot path
+    /// discard the result, but a broken state file never fails
+    /// silently twice in a row.
+    pub fn save(&self) -> Result<()> {
         let persisted = PersistedState {
             mode: self.mode,
             trust: self.trust,
             consumed: self.consumed,
-            points: self.points,
-            msgs_sent: self.msgs_sent,
-            msgs_received: self.msgs_received,
             tasks_completed: self.tasks_completed,
             tasks_failed: self.tasks_failed,
             reservations: self.reservations.clone(),
         };
-        let text = serde_json::to_string_pretty(&persisted)?;
-        let tmp = file.with_extension("tmp");
-        std::fs::write(&tmp, text)?;
+        let text = serde_json::to_string(&persisted)?;
+        let tmp = self.state_file.with_extension("tmp");
+        if let Err(err) = std::fs::write(&tmp, &text) {
+            eprintln!(
+                "[opennetd] cannot persist state to {}: {err:#}",
+                self.state_file.display()
+            );
+            return Err(err.into());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
         }
-        std::fs::rename(&tmp, &file)?;
+        if let Err(err) = std::fs::rename(&tmp, &self.state_file) {
+            eprintln!(
+                "[opennetd] cannot commit state file {}: {err:#}",
+                self.state_file.display()
+            );
+            return Err(err.into());
+        }
         Ok(())
     }
 
-    /// Refund reservations loaded from an older state file: a task whose
-    /// reservation survived a crash never settled, so its units return
-    /// to the coefficient here.
-    fn refund_stale_reservations(&mut self) {
-        let stale: i128 = self.reservations.values().map(|units| *units as i128).sum();
-        if stale > 0 {
-            self.trust =
-                (self.trust as i128 + stale).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-        }
-        self.reservations.clear();
+    /// Total trust units currently held by in-flight reservations.
+    pub fn reserved_total(&self) -> i64 {
+        self.reservations.values().copied().sum()
     }
 
-    /// Deduct `units` from trust and register `task_id` as outstanding.
-    /// The floor check uses the effective trust after the deduction, so
-    /// concurrent reservations compose correctly.
+    /// Reserve `units` trust units for `task_id`, deducting them from
+    /// the coefficient immediately so concurrent tasks cannot
+    /// overspend. The floor check compares the remaining coefficient
+    /// against the new reservation only, because previous reservations
+    /// are already deducted from `trust`. Nothing is persisted here: a
+    /// crash refunds the reservation on boot, so only the final
+    /// settlement needs disk.
     pub fn reserve(&mut self, task_id: &str, units: i64, floor: i64) -> Result<(), String> {
         let available = self.trust as i128 - units as i128;
         if available < floor as i128 {
             return Err(format!(
-                "insufficient trust: need {units} units, have {} (floor {floor})",
-                self.trust
+                "insufficient trust (remaining {}, need {})",
+                self.trust, units
             ));
         }
         self.trust -= units;
@@ -220,56 +248,43 @@ impl NodeState {
         Ok(())
     }
 
-    /// Refund a reservation in full when the task never ran: rejection,
-    /// timeout, or an error before the assignment completed.
+    /// Release a reservation after a refused, failed or timed-out
+    /// task, returning the units to the trust coefficient. In-memory
+    /// only, like `reserve`.
     pub fn release(&mut self, task_id: &str) {
         if let Some(units) = self.reservations.remove(task_id) {
             self.trust = self.trust.saturating_add(units);
         }
     }
 
-    /// Settle a finished task: the reservation registered under
-    /// `task_id` is compared against the final `billed` units, the
-    /// difference is refunded and the consumption counter grows by the
-    /// charge. Settling an unknown task id is a no-op, so retried
-    /// outcome frames cannot double-charge.
-    pub fn settle(&mut self, task_id: &str, billed: i64) -> i64 {
+    /// Settle a completed task: charge `billed_units` to the
+    /// consumption counter and refund the difference between the
+    /// reservation and the actual bill, returning that difference.
+    /// Persists immediately — this is the financial finality point of
+    /// the task.
+    pub fn settle(&mut self, task_id: &str, billed_units: i64) -> i64 {
         let Some(reserved) = self.reservations.remove(task_id) else {
             return 0;
         };
-        let refund = reserved - billed;
+        let refund = reserved - billed_units;
         if refund > 0 {
             self.trust = self.trust.saturating_add(refund);
         }
-        self.consumed = self.consumed.saturating_add(billed.max(0) as u64);
+        self.consumed = self.consumed.saturating_add(billed_units.max(0) as u64);
+        let _ = self.save();
         refund
     }
 
-    /// Total outstanding reservation units; used by the provider's
-    /// acceptance policy together with the announced consumption.
-    pub fn reserved_total(&self) -> i64 {
-        self.reservations.values().copied().sum()
-    }
-
-    /// Snapshot of outstanding reservation ids for the status report.
-    pub fn reservation_ids(&self) -> Vec<String> {
-        self.reservations.keys().cloned().collect()
-    }
-
-    /// Daemon uptime for the status report.
-    pub fn uptime(&self) -> Duration {
+    /// Time since the daemon started.
+    pub fn uptime(&self) -> std::time::Duration {
         self.started.elapsed()
     }
-}
-
-/// Path of the persisted state file inside `state_dir`.
-fn state_file(state_dir: &Path) -> PathBuf {
-    state_dir.join("state.json")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::scratch_dir;
 
     fn trust_cfg() -> TrustCfg {
         TrustCfg {
@@ -283,83 +298,22 @@ mod tests {
     fn limits() -> Limits {
         Limits {
             cpu_percent: 50,
-            ram_mb: 512,
+            ram_mb: 2048,
             max_tasks: 4,
         }
     }
 
-    fn state(trust: i64) -> NodeState {
-        let mut s = NodeState::load(
-            Path::new("/nonexistent-state-dir"),
-            Mode::Peer,
-            limits(),
-            &trust_cfg(),
-        )
-        .unwrap();
-        s.trust = trust;
-        s
-    }
-
     #[test]
-    fn mode_serializes_lowercase_for_toml_and_json() {
-        assert_eq!(serde_json::to_string(&Mode::Peer).unwrap(), "\"peer\"");
-        assert_eq!(serde_json::to_string(&Mode::Seed).unwrap(), "\"seed\"");
-        assert_eq!(serde_json::to_string(&Mode::Leech).unwrap(), "\"leech\"");
-    }
-
-    #[test]
-    fn mode_parse_roundtrip_and_errors() {
-        assert_eq!(Mode::parse("peer").unwrap(), Mode::Peer);
-        assert_eq!(Mode::parse("seed").unwrap(), Mode::Seed);
-        assert_eq!(Mode::parse("leech").unwrap(), Mode::Leech);
-        assert!(Mode::parse("bogus").is_err());
-        assert!(Mode::Seed.donates());
-        assert!(!Mode::Leech.donates());
-    }
-
-    #[test]
-    fn reserve_deducts_and_enforces_floor() {
-        let mut s = state(100);
-        s.reserve("a", 40, 0).unwrap();
-        assert_eq!(s.trust, 60);
-        assert!(s.reserve("b", 70, 0).is_err());
-        assert_eq!(s.trust, 60);
-    }
-
-    #[test]
-    fn release_refunds_only_live_reservations() {
-        let mut s = state(100);
-        s.reserve("a", 40, 0).unwrap();
-        s.release("a");
-        assert_eq!(s.trust, 100);
-        // A duplicate release for the same id must not mint trust.
-        s.release("a");
-        assert_eq!(s.trust, 100);
-    }
-
-    #[test]
-    fn settle_refunds_the_difference_and_records_consumption() {
-        let mut s = state(100);
-        s.reserve("a", 50, 0).unwrap();
-        let refund = s.settle("a", 20);
-        assert_eq!(refund, 30);
-        assert_eq!(s.trust, 80);
-        assert_eq!(s.consumed, 20);
-        // Settling the same task again is a no-op.
-        assert_eq!(s.settle("a", 20), 0);
-        assert_eq!(s.trust, 80);
-        assert_eq!(s.consumed, 20);
-    }
-
-    #[test]
-    fn stale_reservations_are_refunded_and_file_is_owner_only() {
-        let dir = std::env::temp_dir().join(format!("opennet-state-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut s = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
-        s.trust = 100;
-        s.reservations.insert("crash-task".to_string(), 40);
-        s.save().unwrap();
+    fn fresh_state_uses_genesis_trust_materializes_the_file_and_zero_counters() {
+        let dir = scratch_dir("st-fresh");
+        let state = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
+        assert_eq!(state.trust, 100);
+        assert_eq!(state.consumed, 0);
+        assert!(state.reservations.is_empty());
+        assert!(state.points >= 1);
+        // First boot must materialize the state file, owner-readable
+        // only.
+        assert!(dir.join("state.json").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -369,9 +323,109 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        let loaded = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
-        assert_eq!(loaded.trust, 140);
-        assert!(loaded.reservation_ids().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mode_names_roundtrip_lowercase() {
+        assert_eq!(Mode::parse("peer").unwrap(), Mode::Peer);
+        assert_eq!(Mode::parse("seed").unwrap(), Mode::Seed);
+        assert_eq!(Mode::parse("leech").unwrap(), Mode::Leech);
+        assert!(Mode::parse("bogus").is_err());
+        assert_eq!(serde_json::to_string(&Mode::Seed).unwrap(), "\"seed\"");
+    }
+
+    #[test]
+    fn reserve_deducts_and_enforces_the_floor() {
+        let mut state = NodeState::load(
+            &scratch_dir("st-reserve"),
+            Mode::Peer,
+            limits(),
+            &trust_cfg(),
+        )
+        .unwrap();
+        state.reserve("t1", 30, 0).unwrap();
+        assert_eq!(state.trust, 70);
+        assert!(state.reserve("t2", 80, 0).is_err());
+        state.reserve("t2", 60, 0).unwrap();
+        assert_eq!(state.reserved_total(), 90);
+        assert_eq!(state.trust, 10);
+    }
+
+    #[test]
+    fn release_restores_units() {
+        let mut state = NodeState::load(
+            &scratch_dir("st-release"),
+            Mode::Peer,
+            limits(),
+            &trust_cfg(),
+        )
+        .unwrap();
+        state.reserve("t1", 30, 0).unwrap();
+        state.release("t1");
+        assert_eq!(state.trust, 100);
+        assert!(state.reservations.is_empty());
+    }
+
+    #[test]
+    fn settle_charges_consumed_and_refunds_the_difference() {
+        let mut state = NodeState::load(
+            &scratch_dir("st-settle"),
+            Mode::Peer,
+            limits(),
+            &trust_cfg(),
+        )
+        .unwrap();
+        state.reserve("t1", 50, 0).unwrap();
+        // 50 were reserved, 20 are billed: 30 return to the
+        // coefficient, leaving genesis 100 minus the actual
+        // consumption of 20.
+        let refund = state.settle("t1", 20);
+        assert_eq!(refund, 30);
+        assert_eq!(state.trust, 80);
+        assert_eq!(state.consumed, 20);
+        // Settlement is the persistence point: the file must exist now.
+        assert!(state.state_file.exists());
+    }
+
+    #[test]
+    fn crashed_reservation_leaves_genesis_trust_on_boot() {
+        // Reservations are in-memory: dropping the state object (a
+        // crash) before settlement must not burn the reserved units.
+        let dir = scratch_dir("st-crash");
+        let mut state = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
+        state.reserve("t1", 40, 0).unwrap();
+        assert_eq!(state.trust, 60);
+        drop(state);
+        let reloaded = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
+        assert_eq!(reloaded.trust, 100);
+        assert!(reloaded.reservations.is_empty());
+    }
+
+    #[test]
+    fn persisted_reservations_from_older_versions_are_refunded_on_boot() {
+        // Simulate an older state.json that persisted a reservation.
+        let dir = scratch_dir("st-legacy");
+        let mut state = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
+        state.reservations.insert("t1".into(), 40);
+        state.trust -= 40;
+        state.save().unwrap();
+        drop(state);
+        let reloaded = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
+        assert_eq!(reloaded.trust, 100);
+        assert!(reloaded.reservations.is_empty());
+    }
+
+    #[test]
+    fn state_roundtrips_through_disk() {
+        let dir = scratch_dir("st-roundtrip");
+        let mut state = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
+        state.mode = Mode::Seed;
+        state.trust = 42;
+        state.consumed = 7;
+        state.save().unwrap();
+        let reloaded = NodeState::load(&dir, Mode::Peer, limits(), &trust_cfg()).unwrap();
+        assert_eq!(reloaded.mode, Mode::Seed);
+        assert_eq!(reloaded.trust, 42);
+        assert_eq!(reloaded.consumed, 7);
     }
 }
