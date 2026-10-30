@@ -17,7 +17,9 @@
 //!
 //! Every step degrades gracefully: capabilities the current user
 //! lacks (namespace creation, cgroup writes) are skipped with a log
-//! line, and the child still runs.
+//! line, and the child still runs. On platforms without cgroup v2 the
+//! guard is a no-op returning `None`, so callers can use one code
+//! path everywhere.
 //!
 //! The functions take `tokio::process::Command` (the type the
 //! executor and the shard worker build) and operate on its `std` half
@@ -30,11 +32,14 @@ use crate::config::SandboxCfg;
 use std::path::Path;
 use tokio::process::Command;
 
-/// Re-export of the Linux cgroup guard so callers can write
-/// `sandbox::CgroupGuard::attach` regardless of where the platform
-/// implementation lives.
+/// Linux implementation of the cgroup guard.
 #[cfg(target_os = "linux")]
 pub(crate) use linux::CgroupGuard;
+/// No-op cgroup guard on platforms without cgroup v2: attaching always
+/// reports "no limits applied", which the callers treat exactly like a
+/// failed best-effort attach on Linux.
+#[cfg(not(target_os = "linux"))]
+pub(crate) use stub::CgroupGuard;
 
 /// Apply the full task isolation profile to `command`.
 pub fn apply_to_command(
@@ -73,6 +78,31 @@ pub fn apply_to_runner(
     );
     #[cfg(not(target_os = "linux"))]
     let _ = (command, workdir, cfg, inherit_memory_mb);
+}
+
+/// Platform without cgroup v2: the guard never applies limits.
+#[cfg(not(target_os = "linux"))]
+mod stub {
+    use crate::config::SandboxCfg;
+
+    /// No-op cgroup guard; see the crate-level `CgroupGuard` re-export.
+    pub struct CgroupGuard;
+
+    impl CgroupGuard {
+        /// Always returns `None`: there is no cgroup v2 to attach to.
+        pub fn attach(
+            _name: &str,
+            _pid: u32,
+            _cfg: &SandboxCfg,
+            _inherit_memory_mb: u64,
+            _inherit_cpu_percent: u32,
+        ) -> Option<CgroupGuard> {
+            None
+        }
+
+        /// No-op teardown.
+        pub fn teardown(&self) {}
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -244,10 +274,9 @@ mod linux {
         /// Move `pid` into a fresh cgroup under the delegated subtree
         /// and apply `memory.max`, `cpu.max` and `pids.max`. Zero
         /// memory or CPU config values inherit the given task
-        /// defaults. Returns `None` when the subtree is not writable
-        /// (non-systemd init): the child then runs without cgroup
-        /// limits, matching the best-effort policy of the rest of the
-        /// sandbox.
+        /// defaults. Returns `None` when the subtree is not writable:
+        /// the child then runs without cgroup limits, matching the
+        /// best-effort policy of the rest of the sandbox.
         pub fn attach(
             name: &str,
             pid: u32,
