@@ -17,6 +17,7 @@ use crate::message::Message;
 use crate::node::identity::Identity;
 use crate::sandbox;
 use anyhow::{bail, Result};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -261,6 +262,9 @@ async fn spawn_shard(
         runner.env("ROCR_VISIBLE_DEVICES", &devices);
     }
     runner.stdin(std::process::Stdio::null());
+    // A new process group lets the timeout kill the whole runner tree;
+    // platforms without process groups kill the direct child only.
+    #[cfg(unix)]
     runner.as_std_mut().process_group(0);
     sandbox::apply_to_runner(&mut runner, &workdir, &ctx.config.sandbox, ram_mb);
     let mut child = runner.spawn()?;
@@ -281,7 +285,13 @@ async fn spawn_shard(
     let Ok(connect) = tokio::time::timeout(RUNNER_CONNECT_TIMEOUT, listener.accept()).await else {
         // SAFETY: `pid` addresses the child's own process group (created
         // with `process_group(0)`); the daemon lives in a different one.
-        unsafe { libc::killpg(pid, libc::SIGKILL) };
+        // Off Unix there are no process groups: kill the direct child.
+        #[cfg(unix)]
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL)
+        };
+        #[cfg(not(unix))]
+        let _ = child.start_kill();
         let _ = child.wait().await;
         let _ = std::fs::remove_dir_all(&workdir);
         bail!("runner did not connect back");

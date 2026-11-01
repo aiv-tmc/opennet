@@ -144,8 +144,14 @@ pub async fn bridge(
     }
     // SAFETY: `pid` is the child's own process group id (created with
     // `process_group(0)`); the daemon lives in a different group and can
-    // never signal itself.
-    unsafe { libc::killpg(pid, libc::SIGKILL) };
+    // never signal itself. Windows has no process groups: kill the
+    // child directly instead.
+    #[cfg(unix)]
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL)
+    };
+    #[cfg(not(unix))]
+    let _ = child.start_kill();
     let _ = child.wait().await;
     let _ = std::fs::remove_dir_all(&workdir);
     ctx.swarm_procs

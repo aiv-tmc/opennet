@@ -208,15 +208,18 @@ async fn run_command(ctx: &Arc<Ctx>, launch: &Launch) -> Result<TaskOutcome, ()>
             &format!("spawn failed for {}: {err:#}", launch.task_id),
         );
     })?;
-    let pid = child.id().expect("spawned child has a pid");
     #[cfg(unix)]
-    let guard = sandbox::CgroupGuard::attach(
-        &launch.task_id,
-        pid,
-        &ctx.config.sandbox,
-        ram_mb,
-        ctx.config.limits.cpu_percent,
-    );
+    let (guard, pid) = {
+        let pid = child.id().expect("spawned child has a pid");
+        let guard = sandbox::CgroupGuard::attach(
+            &launch.task_id,
+            pid,
+            &ctx.config.sandbox,
+            ram_mb,
+            ctx.config.limits.cpu_percent,
+        );
+        (guard, pid)
+    };
     // Take the pipes before waiting: the three sub-futures borrow three
     // disjoint values (stdout pipe, stderr pipe, child), so they run
     // concurrently inside the timeout without borrow conflicts.

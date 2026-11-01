@@ -1,39 +1,38 @@
 //! Persistent node identity backed by an ed25519 keypair.
 //!
-//! The public node id is derived from the public key, so any signed message
-//! can be checked against its claimed node id without extra bookkeeping.
+//! The public node id is derived from the public key, so any signed
+//! message can be checked against its claimed node id without extra
+//! bookkeeping.
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-/// Node identity able to sign wire messages and derive the public node id.
-///
-/// Cloning is cheap (the 32-byte secret key is copied) and lets every
-/// connection-owning task hold its own handle for handshake signing.
+/// Node identity able to sign wire messages and derive the public node
+/// id. Cloning is cheap (the 32-byte secret key is copied) and lets
+/// every connection-owning task hold its own handle for handshake
+/// signing.
 #[derive(Clone)]
 pub struct Identity {
     signing_key: SigningKey,
 }
 
 impl Identity {
-    /// Generate a fresh in-memory identity; used by tests and benchmarks
-    /// that need a signing key without persisting one.
+    /// Generate a fresh in-memory identity; used by tests and
+    /// benchmarks that need a signing key without persisting one.
     pub fn generate() -> Self {
         Self {
             signing_key: SigningKey::generate(&mut rand::rngs::OsRng),
         }
     }
 
-    /// Load the 32-byte secret key from `<state_dir>/node.key` or generate a
-    /// fresh ed25519 keypair and store it with mode 0600.
-    ///
-    /// The state directory is created when missing so the identity can be
-    /// the first component to touch a fresh state location. A key file of
-    /// unexpected length is reported as an error instead of being silently
-    /// replaced.
+    /// Load the 32-byte secret key from `<state_dir>/node.key` or
+    /// generate a fresh ed25519 keypair and store it with mode 0600 on
+    /// Unix. The state directory is created when missing so the
+    /// identity can be the first component to touch a fresh state
+    /// location. A key file of unexpected length is reported as an
+    /// error instead of being silently replaced.
     pub fn load_or_create(state_dir: &Path) -> Result<Self> {
         let path = state_dir.join("node.key");
         if let Ok(bytes) = std::fs::read(&path) {
@@ -48,10 +47,16 @@ impl Identity {
                 .with_context(|| format!("cannot create state dir {}", parent.display()))?;
         }
         let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Owner-only permissions on the secret key; platforms without
+        // POSIX modes skip this and rely on the directory ACLs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
             .open(&path)
             .and_then(|mut file| file.write_all(&signing_key.to_bytes()))
             .with_context(|| format!("cannot write node key file {}", path.display()))?;
@@ -63,7 +68,8 @@ impl Identity {
         self.signing_key.verifying_key().to_bytes()
     }
 
-    /// Short public node identifier: first 8 bytes of blake3 of the public key.
+    /// Short public node identifier: first 8 bytes of blake3 of the
+    /// public key.
     pub fn node_id(&self) -> String {
         Self::node_id_from_pubkey(&self.pubkey())
     }
@@ -73,12 +79,14 @@ impl Identity {
         hex::encode(&blake3::hash(pubkey).as_bytes()[..8])
     }
 
-    /// Sign a protocol payload; the resulting signature travels on the wire.
+    /// Sign a protocol payload; the resulting signature travels on the
+    /// wire.
     pub fn sign(&self, payload: &[u8]) -> [u8; 64] {
         self.signing_key.sign(payload).to_bytes()
     }
 
-    /// Verify an ed25519 signature against the given public key and payload.
+    /// Verify an ed25519 signature against the given public key and
+    /// payload.
     pub fn verify(pubkey: &[u8; 32], payload: &[u8], signature: &[u8; 64]) -> bool {
         let Ok(key) = VerifyingKey::from_bytes(pubkey) else {
             return false;
@@ -99,9 +107,11 @@ mod tests {
     fn creates_key_with_mode_0600_in_missing_directory() {
         let dir = scratch_dir("id-create");
         let identity = Identity::load_or_create(&dir).unwrap();
-        let metadata = std::fs::metadata(dir.join("node.key")).unwrap();
         #[cfg(unix)]
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        {
+            let metadata = std::fs::metadata(dir.join("node.key")).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
         assert_eq!(identity.node_id().len(), 16);
     }
 

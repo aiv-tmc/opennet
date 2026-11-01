@@ -189,6 +189,9 @@ impl NodeState {
         self.reservations.remove(task_id);
         self.trust -= charge;
         self.consumed = self.consumed.saturating_add(charge as u64);
+        // Settled charges must survive a crash: persist atomically on
+        // every settlement.
+        let _ = self.save();
     }
 
     /// Daemon uptime in whole seconds, for `opennetctl status`.

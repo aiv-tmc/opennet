@@ -4,8 +4,9 @@
 //! the payload is strictly validated (`HELLO tcp:<ip>:<port>` with a real
 //! socket address) so a spoofed datagram cannot inject arbitrary addresses.
 //! The multicast group is joined on every local IPv4 interface enumerated
-//! through getifaddrs, so discovery works on multi-homed hosts (and
-//! compiles on BSD-derived platforms where `sa_family` is a single byte).
+//! through getifaddrs, so discovery works on multi-homed hosts. On
+//! platforms without getifaddrs the list is empty and the join falls back
+//! to the wildcard interface.
 
 use crate::config::NetworkCfg;
 use crate::dht::Dht;
@@ -27,13 +28,17 @@ pub fn spawn(dht: Arc<Mutex<Dht>>, cfg: NetworkCfg, local_id: String) -> JoinHan
         if let Err(err) = run(dht, cfg, local_id).await {
             crate::log::warn(
                 module_path!(),
-                &format!("[discovery] task terminated: {err:#}"),
+                &format!("discovery task terminated: {err:#}"),
             );
         }
     })
 }
 
-/// Enumerate the addresses of all local IPv4 interfaces.
+/// Enumerate the addresses of all local IPv4 interfaces. On Unix this
+/// walks the interface table with getifaddrs; elsewhere it returns an
+/// empty list and the multicast join falls back to the wildcard
+/// interface in `run`.
+#[cfg(unix)]
 fn ipv4_interfaces() -> Vec<Ipv4Addr> {
     let mut out = Vec::new();
     unsafe {
@@ -58,6 +63,13 @@ fn ipv4_interfaces() -> Vec<Ipv4Addr> {
         libc::freeifaddrs(ifap);
     }
     out
+}
+
+/// Off Unix the interface table walk is unavailable; the wildcard join
+/// in `run` still gives a working single-interface discovery.
+#[cfg(not(unix))]
+fn ipv4_interfaces() -> Vec<Ipv4Addr> {
+    Vec::new()
 }
 
 /// Extract the advertised listen address from one datagram payload; accepts
