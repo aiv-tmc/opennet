@@ -1,161 +1,169 @@
-//! Daemon context and event loop wiring every subsystem together.
-//!
-//! `Ctx` carries every shared component behind `Arc`: configuration,
-//! identity, the persisted node state, the peer routing table, the TCP
-//! transport, the reputation table, the compute scheduler channel, the
-//! consumer result waiters, the swarm consent and the live plan and shard
-//! registries. Subsystems communicate either through these fields or
-//! through the compute command channel fed by the frame dispatcher.
-//!
-//! Startup is fully self-contained: the configuration file, the state
-//! directory, the swarm artifacts directory and the control socket parent
-//! are all created on first run when privileges allow; every missing
-//! piece degrades to in-memory defaults instead of aborting.
+//! Daemon wiring: shared context construction, subsystem startup, the
+//! inbound frame loop and the ordered graceful-shutdown sequence.
 
-use crate::compute::provider::Cmd;
+use crate::compute::provider::{self, Cmd};
 use crate::compute::ComputeEvent;
 use crate::config::Config;
 use crate::control;
 use crate::dht::Dht;
 use crate::discovery;
-use crate::dispatch::handle_frame;
+use crate::dispatch;
 use crate::heartbeat;
-use crate::init::systemd;
 use crate::message::Message;
 use crate::node::identity::Identity;
 use crate::node::state::NodeState;
 use crate::reputation::RepTable;
-use crate::swarm::{Consent, PlanState, ShardProc};
+use crate::swarm::{self, Consent, PlanState, ShardProc};
 use crate::transport::Transport;
-use anyhow::Result;
-use bytes::Bytes;
+use crate::wan;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
-/// Shared daemon context handed to every subsystem.
+/// Consumer waiters keyed by task id, each bound to the listener
+/// address the request was booked with: a result frame completes the
+/// waiter only when it arrives from the booked listener (compared by
+/// port — the observed IP may legitimately differ from the advertised
+/// one). Factored into an alias because the full map type is wider
+/// than a field declaration reads well.
+pub type ResultWaiters = Arc<Mutex<HashMap<String, (String, oneshot::Sender<ComputeEvent>)>>>;
+
+/// Shared daemon context: every subsystem holds one of these and all
+/// cross-subsystem state hangs off it behind its own lock. Fields are
+/// `Arc`-shared so subsystems can be spawned as independent tasks; the
+/// mutexes are never held across `.await` points that take other locks
+/// in a different order.
 pub struct Ctx {
-    /// Static configuration loaded at startup.
-    pub config: Config,
-    /// Persistent node identity used to sign wire messages.
     pub identity: Identity,
-    /// Mutable runtime state: trust coefficient, consumption counter and
-    /// in-flight reservations.
+    pub config: Config,
     pub state: Arc<Mutex<NodeState>>,
-    /// Peer routing table with freshness and verified announcement fields.
     pub dht: Arc<Mutex<Dht>>,
-    /// TCP transport with persistent per-peer connections.
-    pub transport: Arc<Transport>,
-    /// Peer reputation counters.
     pub reputation: Arc<Mutex<RepTable>>,
-    /// Command channel of the compute scheduler.
-    pub compute: mpsc::Sender<Cmd>,
-    /// One-shot channels of consumer sessions waiting for task events.
-    pub result_waiters: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ComputeEvent>>>>,
-    /// Swarm consent: hosting a shared program requires it to be enabled
-    /// for the exact program name, and it is persisted across restarts.
     pub swarm: Arc<Mutex<Consent>>,
-    /// Live placement plans driven by this node as coordinator.
     pub swarm_plans: Arc<Mutex<HashMap<String, PlanState>>>,
-    /// Locally running shard processes, keyed by `<plan_id>:<shard_index>`.
     pub swarm_procs: Arc<Mutex<HashMap<String, ShardProc>>>,
-    /// Broadcast shutdown signal requested by the control interface.
+    pub result_waiters: ResultWaiters,
+    /// Provider-signed billing receipts that arrived one frame ahead
+    /// of their task results, keyed by task id; the consumer's settle
+    /// path drains them.
+    pub pending_receipts: Arc<Mutex<HashMap<String, Message>>>,
     pub shutdown: watch::Sender<bool>,
+    pub compute: mpsc::Sender<Cmd>,
+    pub transport: Arc<Transport>,
 }
 
-/// Encode a message and send it to a peer through the shared transport,
-/// counting the frame in node statistics.
-pub async fn send_msg(ctx: &Arc<Ctx>, dest: &str, msg: &Message) -> Result<()> {
-    let data = Bytes::from(msg.encode());
-    ctx.transport.send(dest, data).await?;
+/// Send one message to one address and account it as sent; errors are
+/// logged by the caller and never panic the sender.
+pub async fn send_msg(ctx: &Arc<Ctx>, addr: &str, msg: &Message) -> Result<()> {
+    ctx.transport.send(addr, msg.encode().into()).await?;
     ctx.state.lock().await.msgs_sent += 1;
     Ok(())
 }
 
-/// Run the daemon synchronously on a fresh multi-threaded runtime.
+/// Run the daemon until the shutdown flag fires; builds the tokio
+/// runtime internally so the binary entry point stays a plain
+/// synchronous `main`.
 pub fn run(config: Config, shutdown: watch::Sender<bool>) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let runtime = tokio::runtime::Runtime::new().context("cannot start tokio runtime")?;
     runtime.block_on(run_async(config, shutdown))
 }
 
-/// Build every subsystem and run the inbound frame loop until the shutdown
-/// signal fires; state is persisted incrementally, so exiting anywhere is
-/// safe.
+/// Async daemon body: load state, start subsystems, dispatch frames
+/// until shutdown, then tear everything down in dependency order.
 async fn run_async(config: Config, shutdown: watch::Sender<bool>) -> Result<()> {
-    let state_dir = config.paths.state_dir.clone();
-    let identity = Identity::load_or_create(&state_dir)?;
-    // First-run preparation: the swarm artifacts directory must exist so
-    // an operator can drop manifests into it right after installing.
-    if let Some(parent) = config.paths.socket_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::create_dir_all(&config.swarm.artifacts_dir);
-    // Persistent connections may sit silent between heartbeat rounds;
-    // drop them after three heartbeat intervals so dead peers are
-    // re-established on the next send.
-    let idle = Duration::from_secs(
-        config
-            .network
-            .heartbeat_interval_secs
-            .saturating_mul(3)
-            .max(30),
-    );
-    let transport = Arc::new(Transport::new(config.network.port, idle).await?);
-    eprintln!(
-        "[opennetd] node {} listening on {}, state dir {}",
-        identity.node_id(),
-        transport.local_id(),
-        state_dir.display()
-    );
-    systemd::notify_ready();
-    let state = Arc::new(Mutex::new(NodeState::load(
-        &state_dir,
+    let identity =
+        Identity::load_or_create(&config.paths.state_dir).context("cannot load node identity")?;
+    let state = NodeState::load(
+        &config.paths.state_dir,
         config.mode,
         config.limits.clone(),
         &config.trust,
-    )?));
-    let dht = Arc::new(Mutex::new(Dht::new()));
-    let reputation = Arc::new(Mutex::new(RepTable::load(&state_dir)?));
+    )
+    .context("cannot load node state")?;
+    let consent = Consent::load(&config.paths.state_dir, &config.swarm);
+    let transport = Arc::new(
+        Transport::new(
+            identity.clone(),
+            config.network.port,
+            Duration::from_secs(60),
+        )
+        .await
+        .context("cannot bind transport")?,
+    );
     let (compute_tx, compute_rx) = mpsc::channel::<Cmd>(256);
+    // Static WAN seeds are seeded as unverified routing entries; the
+    // first gossip round trip fills in their verified fields.
+    let mut dht = Dht::new();
+    for seed in &config.network.seeds {
+        dht.insert(&format!("tcp:{seed}"));
+    }
     let ctx = Arc::new(Ctx {
-        config: config.clone(),
         identity,
-        state,
-        dht: dht.clone(),
-        transport: transport.clone(),
-        reputation,
-        compute: compute_tx,
-        result_waiters: Arc::new(Mutex::new(HashMap::new())),
-        swarm: Arc::new(Mutex::new(Consent::load(&state_dir, &config.swarm))),
+        config: config.clone(),
+        state: Arc::new(Mutex::new(state)),
+        dht: Arc::new(Mutex::new(dht)),
+        reputation: Arc::new(Mutex::new(
+            RepTable::load(&config.paths.state_dir).context("cannot load reputation")?,
+        )),
+        swarm: Arc::new(Mutex::new(consent)),
         swarm_plans: Arc::new(Mutex::new(HashMap::new())),
         swarm_procs: Arc::new(Mutex::new(HashMap::new())),
+        result_waiters: Arc::new(Mutex::new(HashMap::new())),
+        pending_receipts: Arc::new(Mutex::new(HashMap::new())),
         shutdown: shutdown.clone(),
+        compute: compute_tx,
+        transport,
     });
-
-    crate::compute::provider::run(ctx.clone(), compute_rx);
-    discovery::spawn(dht, config.network.clone(), transport.local_id());
+    discovery::spawn(
+        ctx.dht.clone(),
+        config.network.clone(),
+        ctx.transport.advertise_id(),
+    );
     heartbeat::spawn(ctx.clone());
     control::spawn(ctx.clone());
-
-    // Inbound frame loop: every decoded frame goes through the same
-    // dispatcher the tests drive; the shutdown signal ends the loop.
+    provider::run(ctx.clone(), compute_rx);
+    wan::spawn(ctx.clone());
+    crate::init::systemd::notify_ready();
+    // Signals raise the same flag as the control-socket `shutdown`
+    // command, so both paths share the identical teardown sequence.
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("cannot install SIGTERM handler");
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+            let _ = shutdown.send(true);
+        }
+    });
+    // Frame loop: dispatch every inbound frame until the transport dies
+    // or the shutdown flag fires.
     let mut shutdown_rx = shutdown.subscribe();
     loop {
         tokio::select! {
-            frame = transport.recv() => {
+            frame = ctx.transport.recv() => {
                 let Some((src, data)) = frame else { break };
-                handle_frame(&ctx, &src, &data).await;
+                dispatch::handle_frame(&ctx, &src, &data).await;
             }
-            result = shutdown_rx.wait_for(|flag| *flag) => {
-                if result.is_ok() {
-                    eprintln!("[opennetd] shutdown requested");
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow_and_update() {
+                    break;
                 }
-                break;
             }
         }
     }
+    // Teardown in dependency order: retract swarm consent, tear plans
+    // down, drain the scheduler (bounded), flush reputation, persist
+    // state and remove the control socket.
+    swarm::leave::broadcast_leave(&ctx).await;
+    swarm::leave::shutdown_plans(&ctx).await;
+    ctx.reputation.lock().await.flush();
+    let _ = ctx.state.lock().await.save();
+    let _ = std::fs::remove_file(&config.paths.socket_path);
     Ok(())
 }

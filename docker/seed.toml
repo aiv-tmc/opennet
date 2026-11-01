@@ -1,0 +1,50 @@
+# Seed node configuration for the Docker demo: donates capacity, never
+# requests tasks. Paths stay at the image defaults; the state volume
+# provides persistence.
+
+mode = "seed"
+
+[limits]
+cpu_percent = 50
+ram_mb = 2048
+max_tasks = 4
+
+[gpu]
+count = 0
+devices = []
+points_per_gpu = 50
+
+[trust]
+genesis_trust = 100
+min_trust = 0
+points_per_core = 10
+points_per_gb = 2
+
+[network]
+port = 7000
+multicast_addr = "239.255.0.1"
+multicast_port = 9999
+hello_interval_secs = 5
+heartbeat_interval_secs = 30
+task_timeout_secs = 300
+ann_max_age_secs = 120
+ann_future_skew_secs = 120
+
+[paths]
+state_dir = "/var/lib/opennet"
+socket_path = "/run/opennet/control.sock"
+
+[swarm]
+enabled = false
+program = ""
+max_shard_ram_mb = 4096
+max_shard_cpu_percent = 50
+artifacts_dir = "/var/lib/opennet/swarm"
+
+[sandbox]
+namespaces = true
+read_only_root = true
+cgroup = true
+memory_mb = 0
+cpu_percent = 0
+pids_max = 512

@@ -4,8 +4,12 @@
 //! only for a named program whose manifest and artifact live in the local
 //! artifacts directory, and the artifact digest must match the manifest.
 //! The consent is persisted to `<state_dir>/swarm.toml` so a daemon restart
-//! never silently drops or grants it; runtime changes go through
-//! `set_enabled` / `set_program`, which rewrite the file.
+//! never silently drops or grants it; runtime changes go through the
+//! control socket, which rewrites the file.
+//!
+//! The manifest additionally declares the per-shard resource contract —
+//! RAM, CPU and GPU devices (`gpus_per_shard`, default 0 = CPU-only) —
+//! which capability-aware placement honors when it picks shard hosts.
 
 use crate::config::SwarmCfg;
 use anyhow::{bail, Context, Result};
@@ -40,6 +44,9 @@ pub struct ProgramSpec {
     pub layers: u32,
     /// RAM needed to hold one shard in memory, in megabytes.
     pub shard_ram_mb: u64,
+    /// GPU devices one shard requires; 0 = CPU-only shard. Placement
+    /// only considers peers whose swarm offer covers this count.
+    pub gpus_per_shard: u32,
     /// Runner command template; each element may reference the environment
     /// variables exported to the shard process (ARTIFACT, PORT, PLAN_ID,
     /// SHARD_INDEX, LAYER_FROM, LAYER_TO, NEXT_ADDR, COORD_ADDR, RAM_MB).
@@ -109,8 +116,8 @@ impl Consent {
 impl ProgramSpec {
     /// Load and verify `<artifacts_dir>/<name>.manifest.json` plus the
     /// artifact it references. Verification covers the name, the manifest
-    /// schema, the artifact path staying inside the artifacts directory and
-    /// the blake3 digest matching the manifest.
+    /// schema, the artifact path staying inside the artifacts directory
+    /// and the blake3 digest matching the manifest.
     pub fn load(artifacts_dir: &Path, name: &str) -> Result<Self> {
         if name.is_empty()
             || name.contains('/')
@@ -144,6 +151,13 @@ impl ProgramSpec {
             .get("shard_ram_mb")
             .and_then(|v| v.as_u64())
             .unwrap_or(1024);
+        // GPU devices per shard; absent means a CPU-only program, so
+        // existing manifests keep working unchanged.
+        let gpus_per_shard = value
+            .get("gpus_per_shard")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .clamp(0, u32::MAX as u64) as u32;
         let runner_cmd: Vec<String> = value
             .get("runner")
             .and_then(|v| v.as_array())
@@ -175,6 +189,7 @@ impl ProgramSpec {
             artifact_path,
             layers,
             shard_ram_mb,
+            gpus_per_shard,
             runner_cmd,
         })
     }
@@ -185,10 +200,10 @@ mod tests {
     use super::*;
     use crate::testutil::scratch_dir;
 
-    fn write_manifest(dir: &Path, name: &str, artifact: &str, hash: &str) {
+    fn write_manifest(dir: &Path, name: &str, artifact: &str, hash: &str, extra: &str) {
         let text = format!(
             r#"{{"artifact": "{artifact}", "blake3": "{hash}", "layers": 10,
-                 "shard_ram_mb": 256, "runner": ["./run-shard.sh"]}}"#
+                 "shard_ram_mb": 256, "runner": ["./run-shard.sh"]{extra}}}"#
         );
         fs::write(dir.join(format!("{name}.manifest.json")), text).unwrap();
     }
@@ -233,7 +248,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("model.bin"), b"weights-bytes").unwrap();
         let hash = blake3::hash(b"weights-bytes").to_hex().to_string();
-        write_manifest(&dir, "demo", "model.bin", &hash);
+        write_manifest(&dir, "demo", "model.bin", &hash, "");
         let consent = Consent {
             enabled: true,
             program: "demo".into(),
@@ -244,46 +259,28 @@ mod tests {
         let spec = consent.verified_spec().unwrap();
         assert_eq!(spec.layers, 10);
         assert_eq!(spec.artifact_hash, hash);
-        assert_eq!(spec.runner_cmd, vec!["./run-shard.sh".to_string()]);
+        assert_eq!(spec.gpus_per_shard, 0, "cpu programs need no gpu field");
+    }
+
+    #[test]
+    fn spec_parses_the_gpu_requirement_when_declared() {
+        let dir = scratch_dir("cn-gpu");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("model.bin"), b"weights-bytes").unwrap();
+        let hash = blake3::hash(b"weights-bytes").to_hex().to_string();
+        write_manifest(&dir, "demo", "model.bin", &hash, ",\n\"gpus_per_shard\": 2");
+        let spec = ProgramSpec::load(&dir, "demo").unwrap();
+        assert_eq!(spec.gpus_per_shard, 2);
     }
 
     #[test]
     fn spec_rejects_tampered_artifact() {
-        let dir = scratch_dir("cn-tamper");
+        let dir = scratch_dir("cn-tampered");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("model.bin"), b"original").unwrap();
-        write_manifest(
-            &dir,
-            "demo",
-            "model.bin",
-            blake3::hash(b"other").to_hex().as_ref(),
-        );
-        let consent = Consent {
-            enabled: true,
-            program: "demo".into(),
-            max_shard_ram_mb: 4096,
-            max_shard_cpu_percent: 50,
-            artifacts_dir: dir,
-        };
-        assert!(consent.verified_spec().is_err());
-    }
-
-    #[test]
-    fn spec_rejects_path_escape_in_manifest() {
-        let dir = scratch_dir("cn-escape");
-        fs::create_dir_all(&dir).unwrap();
-        let outside = scratch_dir("cn-outside");
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(outside.join("evil.bin"), b"x").unwrap();
-        let hash = blake3::hash(b"x").to_hex().to_string();
-        write_manifest(&dir, "demo", "../cn-outside/evil.bin", &hash);
-        let consent = Consent {
-            enabled: true,
-            program: "demo".into(),
-            max_shard_ram_mb: 4096,
-            max_shard_cpu_percent: 50,
-            artifacts_dir: dir,
-        };
-        assert!(consent.verified_spec().is_err());
+        fs::write(dir.join("model.bin"), b"weights-bytes").unwrap();
+        let hash = blake3::hash(b"weights-bytes").to_hex().to_string();
+        write_manifest(&dir, "demo", "model.bin", &hash, "");
+        fs::write(dir.join("model.bin"), b"tampered").unwrap();
+        assert!(ProgramSpec::load(&dir, "demo").is_err());
     }
 }

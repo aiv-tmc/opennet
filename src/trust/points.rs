@@ -1,68 +1,56 @@
-//! Capacity pricing: every node converts its *offered* hardware into a
-//! static price tag measured in points, announces it to peers and uses it
-//! to charge trust units for executed tasks.
+//! Capacity pricing: hardware offers are converted to integer capacity
+//! points, and points plus time convert to trust units. Both sides of
+//! the market compute prices from the same announced points, so the
+//! reservation the consumer makes always matches the reservation the
+//! provider checks and the units the executor credits.
 //!
-//! Points reflect the capacity the node actually makes available to the
-//! network (`limits`), not the raw machine size, so a large server that
-//! offers little cannot price itself like a large server that offers a lot.
+//! CPU capacity counts whole cores (50% of 8 cores = 4 cores) and RAM
+//! capacity counts whole GiB; GPU capacity is priced separately per
+//! device so an accelerator offer does not distort the CPU/RAM price.
 
-use crate::config::{Limits, TrustCfg};
+use crate::config::{GpuCfg, Limits, TrustCfg};
 
-/// Fallback RAM total (in megabytes) used when the kernel does not expose
-/// /proc/meminfo, so pricing still works on non-Linux systems.
-const FALLBACK_RAM_MB: u64 = 1024;
-
-/// Extract the MemTotal value (in kB) from /proc/meminfo-formatted text;
-/// returns `None` when no parseable MemTotal line exists.
-fn memtotal_kb(text: &str) -> Option<u64> {
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("MemTotal:") else {
-            continue;
-        };
-        let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
-        return Some(kb);
-    }
-    None
-}
-
-/// Read the machine's total RAM in megabytes from /proc/meminfo; falls back
-/// to a small constant when the file is missing or unparsable.
-fn total_ram_mb() -> u64 {
-    std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| memtotal_kb(&text))
-        .map(|kb| kb / 1024)
-        .unwrap_or(FALLBACK_RAM_MB)
-}
-
-/// Compute this node's capacity points from the hardware it offers to the
-/// network: offered CPU cores (total cores scaled by `cpu_percent`) plus
-/// offered gibibytes of RAM (total RAM capped by `ram_mb`), clamped to at
-/// least one point so even tiny devices can participate in the market.
+/// Capacity points for the offered CPU/RAM capacity: whole cores times
+/// the per-core price plus whole GiB times the per-GiB price.
 pub fn compute_points(cfg: &TrustCfg, limits: &Limits) -> u32 {
-    let cores = std::thread::available_parallelism()
-        .map(|count| count.get() as u64)
-        .unwrap_or(1);
-    let offered_cores = ((cores * limits.cpu_percent as u64) / 100).max(1);
-    let offered_ram_gb = (total_ram_mb().min(limits.ram_mb) / 1024).max(1);
-    let points =
-        offered_cores * cfg.points_per_core as u64 + offered_ram_gb * cfg.points_per_gb as u64;
-    points.clamp(1, u32::MAX as u64) as u32
+    offered_cores(limits.cpu_percent) * cfg.points_per_core
+        + offered_gib(limits.ram_mb) * cfg.points_per_gb
 }
 
-/// Trust units a task reserves and eventually moves: the provider's point
-/// price per started minute of the billing window, at least one minute;
-/// any partially started minute counts as a full one. Both sides derive the
-/// value from the announced points and one agreed duration, so they always
-/// agree on the charge.
-pub fn units_for(points: u32, secs: u64) -> i64 {
-    let minutes = secs.div_ceil(60).max(1) as i64;
-    points as i64 * minutes
+/// Capacity points contributed by the offered GPUs: one price per
+/// device, regardless of model; nodes with no GPUs add zero.
+pub fn gpu_points(gpu: &GpuCfg) -> u32 {
+    gpu.count.saturating_mul(gpu.points_per_gpu)
+}
+
+/// Total announced capacity points: the CPU/RAM offer plus the GPU
+/// offer. This is the number the heartbeat announces and the market
+/// prices tasks against.
+pub fn total_points(cfg: &TrustCfg, limits: &Limits, gpu: &GpuCfg) -> u32 {
+    compute_points(cfg, limits).saturating_add(gpu_points(gpu))
+}
+
+/// Whole CPU cores offered at the given percent of a 4-core baseline.
+pub fn offered_cores(cpu_percent: u32) -> u32 {
+    (((u64::from(cpu_percent) * 4) / 100).max(1)) as u32
+}
+
+/// Whole GiB offered.
+pub fn offered_gib(ram_mb: u64) -> u32 {
+    ((ram_mb / 1024).max(1)) as u32
+}
+
+/// Trust units one task reserves and may be charged: points times the
+/// number of started minutes, with any partial minute rounding up.
+pub fn units_for(points: u32, timeout_secs: u64) -> i64 {
+    let minutes = timeout_secs.div_ceil(60).max(1);
+    (u64::from(points) * minutes) as i64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TrustCfg;
 
     fn cfg() -> TrustCfg {
         TrustCfg {
@@ -70,48 +58,57 @@ mod tests {
             min_trust: 0,
             points_per_core: 10,
             points_per_gb: 2,
+            new_node_units_factor: 2,
+        }
+    }
+
+    fn limits() -> Limits {
+        Limits {
+            cpu_percent: 50,
+            ram_mb: 2048,
+            max_tasks: 4,
         }
     }
 
     #[test]
-    fn memtotal_parses_standard_proc_meminfo() {
-        let text = "MemTotal:        8167848 kB\nMemFree:          123456 kB\n";
-        assert_eq!(memtotal_kb(text), Some(8_167_848));
+    fn points_come_from_whole_cores_and_whole_gib() {
+        assert_eq!(compute_points(&cfg(), &limits()), 24);
+        assert_eq!(offered_cores(25), 1);
+        assert_eq!(offered_cores(200), 8);
+        assert_eq!(offered_gib(1023), 1);
+        assert_eq!(offered_gib(4096), 4);
     }
 
     #[test]
-    fn memtotal_rejects_missing_or_malformed_input() {
-        assert_eq!(memtotal_kb(""), None);
-        assert_eq!(memtotal_kb("MemFree: 100 kB\n"), None);
-        assert_eq!(memtotal_kb("MemTotal: notanumber kB\n"), None);
+    fn gpu_points_scale_with_device_count_and_zero_by_default() {
+        let mut gpu = GpuCfg::default();
+        assert_eq!(gpu_points(&gpu), 0);
+        gpu.count = 2;
+        assert_eq!(gpu_points(&gpu), 100);
+        gpu.points_per_gpu = 80;
+        assert_eq!(gpu_points(&gpu), 160);
     }
 
     #[test]
-    fn offered_limits_cap_the_point_price() {
-        let cheap = compute_points(
-            &cfg(),
-            &Limits {
-                cpu_percent: 10,
-                ram_mb: 1024,
-                max_tasks: 1,
-            },
-        );
-        let rich = compute_points(
-            &cfg(),
-            &Limits {
-                cpu_percent: 100,
-                ram_mb: 1_048_576,
-                max_tasks: 64,
-            },
-        );
-        assert!(rich > cheap);
-        assert!(cheap >= 1);
+    fn total_points_add_gpu_capacity_to_the_cpu_ram_offer() {
+        let mut gpu = GpuCfg::default();
+        assert_eq!(total_points(&cfg(), &limits(), &gpu), 24);
+        gpu.count = 1;
+        gpu.points_per_gpu = 50;
+        assert_eq!(total_points(&cfg(), &limits(), &gpu), 74);
     }
 
     #[test]
-    fn units_follow_billed_seconds() {
-        assert_eq!(units_for(2, 0), 2);
-        assert_eq!(units_for(2, 61), 4);
-        assert_eq!(units_for(3, 300), 15);
+    fn units_round_up_to_started_minutes() {
+        assert_eq!(units_for(24, 1), 24);
+        assert_eq!(units_for(24, 59), 24);
+        assert_eq!(units_for(24, 60), 24);
+        assert_eq!(units_for(24, 61), 48);
+        assert_eq!(units_for(24, 300), 120);
+    }
+
+    #[test]
+    fn units_survive_large_timeouts() {
+        assert_eq!(units_for(24, 31_536_000), 24 * 525_600);
     }
 }

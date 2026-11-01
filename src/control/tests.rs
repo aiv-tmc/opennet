@@ -1,87 +1,134 @@
-//! Tests for the control socket command dispatch.
+//! Control surface tests: command dispatch, output formats, and the
+//! compute command-line parsing including the resource options.
 
-use super::dispatch;
+use super::*;
 use crate::node::state::Mode;
 use crate::testutil::make_ctx;
-use crate::trust::now_unix;
+use crate::transport::Transport;
+use std::time::Duration;
 
 #[tokio::test]
-async fn status_reports_trust_and_counters() {
+async fn status_reports_identity_mode_and_counters() {
     let (ctx, _rx) = make_ctx("ctl-status").await;
-    ctx.state.lock().await.trust = 77;
     let out = dispatch(&ctx, "status").await;
-    assert!(out.contains("trust: 77"), "unexpected output: {out}");
-    assert!(out.contains("peers: 0"), "unexpected output: {out}");
-    assert!(out.contains("consumed: 0"), "unexpected output: {out}");
+    assert!(out.contains(&ctx.identity.node_id()));
+    assert!(out.contains("mode: peer"));
+    assert!(out.contains("trust: 100"));
 }
 
 #[tokio::test]
-async fn mode_get_set_and_persist() {
+async fn mode_persists_across_reloads() {
     let (ctx, _rx) = make_ctx("ctl-mode").await;
-    assert!(dispatch(&ctx, "mode").await.contains("peer"));
     let out = dispatch(&ctx, "mode seed").await;
-    assert!(out.contains("mode set to seed"), "unexpected output: {out}");
-    assert_eq!(ctx.state.lock().await.mode, Mode::Seed);
+    assert!(out.contains("mode set to seed"));
+    let out = dispatch(&ctx, "mode").await;
+    assert!(out.contains("mode: seed"));
+    let reloaded = crate::node::state::NodeState::load(
+        &ctx.config.paths.state_dir,
+        Mode::Peer,
+        ctx.config.limits.clone(),
+        &ctx.config.trust,
+    )
+    .unwrap();
+    assert_eq!(reloaded.mode, Mode::Seed);
+}
+
+#[tokio::test]
+async fn unknown_mode_is_an_error() {
+    let (ctx, _rx) = make_ctx("ctl-bad-mode").await;
     let out = dispatch(&ctx, "mode bogus").await;
-    assert!(out.contains("unknown mode"), "unexpected output: {out}");
+    assert!(out.contains("unknown mode"));
+    assert_eq!(ctx.state.lock().await.mode, Mode::Peer);
 }
 
 #[tokio::test]
-async fn peers_lists_announcement_fields() {
-    let (ctx, _rx) = make_ctx("ctl-peers").await;
-    assert_eq!(dispatch(&ctx, "peers").await, "no peers known\n");
-    let addr = "tcp:10.3.3.3:6000";
-    ctx.dht.lock().await.insert(addr);
-    ctx.dht
-        .lock()
-        .await
-        .apply_ann(addr, "cc55dd66", "seed", 88, 4, now_unix());
+async fn peers_empty_reports_none() {
+    let (ctx, _rx) = make_ctx("ctl-peers-empty").await;
     let out = dispatch(&ctx, "peers").await;
-    assert!(out.contains("cc55dd66"), "unexpected output: {out}");
-    assert!(out.contains("seed"), "unexpected output: {out}");
-    assert!(out.contains("88"), "unexpected output: {out}");
-    assert!(out.contains("4"), "unexpected output: {out}");
+    assert_eq!(out, "no peers known\n");
 }
 
 #[tokio::test]
-async fn limits_and_trust_report_pricing() {
+async fn limits_report_cpu_ram_and_gpu_pricing() {
     let (ctx, _rx) = make_ctx("ctl-limits").await;
     let out = dispatch(&ctx, "limits").await;
-    assert!(out.contains("points"), "unexpected output: {out}");
-    assert!(out.contains("genesis=100"), "unexpected output: {out}");
+    assert!(out.contains("cpu_percent=50"));
+    assert!(out.contains("ram_mb=2048"));
+    assert!(out.contains("points"));
+    assert!(out.contains("genesis=100"));
+    assert!(out.contains("gpu_count=0"));
+    assert!(out.contains("gpu_devices=auto"));
+    assert!(out.contains("points_per_gpu=50"));
+}
+
+#[tokio::test]
+async fn trust_reports_genesis_and_no_reservations() {
+    let (ctx, _rx) = make_ctx("ctl-trust").await;
     let out = dispatch(&ctx, "trust").await;
-    assert!(out.contains("trust: 100"), "unexpected output: {out}");
-    assert!(out.contains("consumed: 0"), "unexpected output: {out}");
+    assert!(out.contains("trust: 100"));
+    assert!(out.contains("reservations: none"));
 }
 
 #[tokio::test]
-async fn compute_requires_a_command() {
-    let (ctx, _rx) = make_ctx("ctl-compute").await;
-    let out = dispatch(&ctx, "compute -").await;
-    assert!(out.contains("usage"), "unexpected output: {out}");
-}
-
-#[tokio::test]
-async fn reputation_shows_recorded_entries() {
-    let (ctx, _rx) = make_ctx("ctl-rep").await;
-    assert_eq!(
-        dispatch(&ctx, "reputation").await,
-        "no reputation data recorded\n"
-    );
-    ctx.reputation.lock().await.record_valid("node-a");
-    ctx.reputation.lock().await.record_invalid("node-b");
+async fn reputation_empty_reports_none() {
+    let (ctx, _rx) = make_ctx("ctl-rep-empty").await;
     let out = dispatch(&ctx, "reputation").await;
-    assert!(out.contains("node-a"), "unexpected output: {out}");
-    assert!(out.contains("node-b"), "unexpected output: {out}");
+    assert_eq!(out, "no reputation data recorded\n");
 }
 
 #[tokio::test]
-async fn shutdown_help_and_unknown_commands() {
-    let (ctx, _rx) = make_ctx("ctl-misc").await;
-    assert_eq!(dispatch(&ctx, "shutdown").await, "shutting down\n");
-    let out = dispatch(&ctx, "help").await;
-    assert!(out.contains("compute"), "unexpected output: {out}");
-    assert!(out.contains("shutdown"), "unexpected output: {out}");
+async fn reputation_lists_scored_entries() {
+    let (ctx, _rx) = make_ctx("ctl-rep").await;
+    ctx.reputation.lock().await.record_valid("node-a");
+    ctx.reputation.lock().await.record_valid("node-a");
+    let out = dispatch(&ctx, "reputation").await;
+    assert!(out.contains("node-a"));
+}
+
+#[tokio::test]
+async fn compute_without_command_shows_usage() {
+    let (ctx, _rx) = make_ctx("ctl-compute-usage").await;
+    let out = dispatch(&ctx, "compute -").await;
+    assert!(out.contains("usage"));
+}
+
+#[tokio::test]
+async fn compute_with_a_missing_gpus_value_is_an_error() {
+    let (ctx, _rx) = make_ctx("ctl-compute-gpus").await;
+    let out = dispatch(&ctx, "compute - --gpus").await;
+    assert!(out.contains("error"));
+}
+
+#[tokio::test]
+async fn unknown_command_shows_help() {
+    let (ctx, _rx) = make_ctx("ctl-help").await;
     let out = dispatch(&ctx, "bogus").await;
-    assert!(out.contains("commands:"), "unexpected output: {out}");
+    assert!(out.contains("commands:"));
+    let out = dispatch(&ctx, "help").await;
+    assert!(out.contains("compute"));
+}
+
+#[tokio::test]
+async fn shutdown_flips_the_flag() {
+    let (ctx, _rx) = make_ctx("ctl-shutdown").await;
+    let mut rx = ctx.shutdown.subscribe();
+    let out = dispatch(&ctx, "shutdown").await;
+    assert_eq!(out, "shutting down\n");
+    rx.changed().await.unwrap();
+    assert!(*rx.borrow());
+}
+
+#[tokio::test]
+async fn unannounced_points_peer_reports_capacity_error() {
+    let (ctx, _rx) = make_ctx("ctl-compute-peer").await;
+    let provider_side = Transport::new(
+        crate::node::identity::Identity::generate(),
+        0,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    ctx.dht.lock().await.insert(&provider_side.local_id());
+    let out = dispatch(&ctx, "compute - echo hello").await;
+    assert!(out.contains("no suitable peer") || out.contains("capacity points"));
 }

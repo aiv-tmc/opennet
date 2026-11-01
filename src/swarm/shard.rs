@@ -4,9 +4,10 @@
 //! constraint is re-verified before any process exists: signature and
 //! freshness, known verified peer, explicit local consent for exactly
 //! this program, manifest digest match against the on-disk artifact,
-//! the consent RAM cap, a sane layer range, no duplicate shard index
-//! for the plan, and a global cap on concurrently hosted shards. Only
-//! then does the runner spawn — exec'd directly from the local manifest
+//! the consent RAM cap, the GPU requirement against the devices this
+//! node offers, a sane layer range, no duplicate shard index for the
+//! plan, and a global cap on concurrently hosted shards. Only then
+//! does the runner spawn — exec'd directly from the local manifest
 //! argv (the runner command never travels on the wire) with the runner
 //! sandbox profile, which keeps the host network namespace so the
 //! runner can reach the worker's loopback listener.
@@ -32,22 +33,26 @@ const RUNNER_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_LOCAL_SHARDS: usize = 16;
 
 /// Verify a coordinator's launch request and, when every check passes,
-/// spawn the local shard runner and register its bridge. Errors are
-/// reported back to the coordinator as a failed plan.
+/// spawn the local shard runner and register its bridge. Failures are
+/// reported back to the coordinator as a plan event whose reason names
+/// the failed shard, so the coordinator can relaunch it on the plan's
+/// spare slot.
 pub async fn handle_launch(ctx: &Arc<Ctx>, src: &str, launch: Message) -> Result<()> {
     if let Err(err) = try_launch(ctx, src, &launch).await {
-        let plan_id = match &launch {
-            Message::ShardLaunch { plan_id, .. } => plan_id.clone(),
-            _ => String::new(),
+        let (plan_id, shard_index) = match &launch {
+            Message::ShardLaunch {
+                plan_id,
+                shard_index,
+                ..
+            } => (plan_id.clone(), *shard_index),
+            _ => (String::new(), 0),
         };
-        // A failed shard ends the whole plan everywhere: every other
-        // host tears its runner down on the retraction.
         let _ = send_msg(
             ctx,
             src,
             &Message::SwarmDone {
                 plan_id,
-                reason: format!("shard launch failed: {err:#}"),
+                reason: format!("shard {shard_index} launch failed: {err:#}"),
             },
         )
         .await;
@@ -57,7 +62,7 @@ pub async fn handle_launch(ctx: &Arc<Ctx>, src: &str, launch: Message) -> Result
 }
 
 /// The full launch pipeline, separated so the caller can translate any
-/// failure into a plan-wide retraction.
+/// failure into a plan-wide failover signal.
 async fn try_launch(ctx: &Arc<Ctx>, src: &str, launch: &Message) -> Result<()> {
     let Message::ShardLaunch {
         plan_id,
@@ -67,6 +72,7 @@ async fn try_launch(ctx: &Arc<Ctx>, src: &str, launch: &Message) -> Result<()> {
         layer_from,
         layer_to,
         ram_mb,
+        gpus,
         next_addr,
         unix_ts,
         pubkey,
@@ -76,7 +82,8 @@ async fn try_launch(ctx: &Arc<Ctx>, src: &str, launch: &Message) -> Result<()> {
         bail!("not a shard launch");
     };
     // The launch must be signed by the coordinator over the exact fields
-    // it carries; any tamper breaks the binding.
+    // it carries — including the GPU requirement; any tamper breaks the
+    // binding.
     let sig: [u8; 64] = signature
         .as_slice()
         .try_into()
@@ -88,6 +95,8 @@ async fn try_launch(ctx: &Arc<Ctx>, src: &str, launch: &Message) -> Result<()> {
         artifact_hash,
         *layer_from,
         *layer_to,
+        *ram_mb,
+        *gpus,
         next_addr,
         *unix_ts,
     );
@@ -125,6 +134,16 @@ async fn try_launch(ctx: &Arc<Ctx>, src: &str, launch: &Message) -> Result<()> {
     if *ram_mb > consent.max_shard_ram_mb {
         bail!("launch exceeds local shard RAM cap");
     }
+    // The GPU requirement must fit the devices this node offers;
+    // operators partition cards between compute tasks and shard
+    // runners with the `[gpu].devices` list.
+    let offered = offered_devices(ctx);
+    if *gpus as usize > offered.len() {
+        bail!(
+            "shard requires {gpus} GPU(s), this node offers {}",
+            offered.len()
+        );
+    }
     if spec.runner_cmd.is_empty() {
         bail!("manifest declares no runner command");
     }
@@ -156,8 +175,20 @@ async fn try_launch(ctx: &Arc<Ctx>, src: &str, launch: &Message) -> Result<()> {
         *ram_mb,
         consent_cpu(ctx).await,
         next_addr,
+        &offered[..*gpus as usize],
     )
     .await
+}
+
+/// Device indices this node offers for shard hosting: the explicit
+/// configured list, or the first `count` indices.
+pub(crate) fn offered_devices(ctx: &Arc<Ctx>) -> Vec<u32> {
+    let gpu = &ctx.config.gpu;
+    if !gpu.devices.is_empty() {
+        gpu.devices.clone()
+    } else {
+        (0..gpu.count).collect()
+    }
 }
 
 /// Read the consent CPU cap without holding the lock across the spawn.
@@ -168,7 +199,9 @@ async fn consent_cpu(ctx: &Arc<Ctx>) -> u32 {
 /// Spawn one shard runner process and its bridge task. The runner talks
 /// to the worker over a loopback listener bound here in the daemon's
 /// network namespace; the runner sandbox profile deliberately keeps the
-/// host network namespace so that loopback stays reachable.
+/// host network namespace so that loopback stays reachable. When the
+/// manifest requires GPUs, the runner receives the pinned device set
+/// through the accelerator environment variables.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_shard(
     ctx: &Arc<Ctx>,
@@ -181,6 +214,7 @@ async fn spawn_shard(
     ram_mb: u64,
     cpu_percent: u32,
     next_addr: &str,
+    gpus: &[u32],
 ) -> Result<()> {
     // Unique scratch directory; also the child's HOME/TMPDIR and, under
     // the mount sandbox, the only writable place the runner can see.
@@ -215,6 +249,17 @@ async fn spawn_shard(
     // connection the launch arrived on.
     runner.env("COORD_ADDR", coord_addr);
     runner.env("RAM_MB", ram_mb.to_string());
+    if !gpus.is_empty() {
+        let devices = gpus
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        // CUDA and ROCm honor their own variable; exporting both pins
+        // the same device set across vendor toolchains.
+        runner.env("CUDA_VISIBLE_DEVICES", &devices);
+        runner.env("ROCR_VISIBLE_DEVICES", &devices);
+    }
     runner.stdin(std::process::Stdio::null());
     runner.as_std_mut().process_group(0);
     sandbox::apply_to_runner(&mut runner, &workdir, &ctx.config.sandbox, ram_mb);
@@ -231,8 +276,8 @@ async fn spawn_shard(
         cpu_percent,
     );
     // Wait for the runner's connect-back; a runner that never connects
-    // (missing binary, sandbox misconfiguration) fails the shard instead
-    // of blocking the plan forever.
+    // (missing binary, sandbox misconfiguration) fails the shard
+    // instead of blocking the plan forever.
     let Ok(connect) = tokio::time::timeout(RUNNER_CONNECT_TIMEOUT, listener.accept()).await else {
         // SAFETY: `pid` addresses the child's own process group (created
         // with `process_group(0)`); the daemon lives in a different one.

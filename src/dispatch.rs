@@ -1,47 +1,35 @@
-//! Inbound frame dispatcher: routes decoded wire messages to the compute
-//! market, the swarm subsystem or the routing table after authenticating
-//! every signed payload.
-//!
-//! The dispatcher is transport-agnostic: it receives `(source address,
-//! frame bytes)` pairs from any transport and replies through the shared
-//! transport, so the daemon loop and the tests drive the exact same code
-//! path. Every message that can trigger local action is authenticated
-//! here, before it reaches a scheduler: bids and assignments against the
-//! compute market, swarm offers and shard launches against the consent
-//! gate.
+//! Frame dispatch: authenticates signed frames and routes them to the
+//! owning subsystem, attributing verification failures to the connection
+//! address so a replayed frame cannot damage the reputation of the
+//! identity it borrows.
 
+use crate::compute::policy::verify_assign;
 use crate::compute::provider::Cmd;
-use crate::compute::{self, ComputeEvent};
-use crate::daemon::Ctx;
+use crate::compute::ComputeEvent;
 use crate::message::Message;
 use crate::node::identity::Identity;
 use crate::swarm;
-use crate::trust::handlers;
+use crate::trust::handlers::{handle_ann, verify_bid, verify_receipt, verify_receipt_ack};
+use crate::wan;
 use std::sync::Arc;
 
-/// Re-export of the shared send helper so callers can address it either
-/// through the dispatcher or through the daemon module.
-pub use crate::daemon::send_msg;
-
-/// Convert a wire signature blob to the fixed array verification expects.
-fn sig_array(signature: &[u8]) -> Option<&[u8; 64]> {
-    signature.try_into().ok()
-}
-
-/// Handle one inbound wire frame by dispatching it to its subsystem.
-pub(crate) async fn handle_frame(ctx: &Arc<Ctx>, src: &str, data: &[u8]) {
+/// Handle one inbound frame from `src` (the validated connection
+/// address): decode, authenticate, route. The total message counter
+/// moves on every frame so `opennetctl status` reflects wire health.
+pub async fn handle_frame(ctx: &Arc<crate::daemon::Ctx>, src: &str, data: &[u8]) {
     ctx.state.lock().await.msgs_received += 1;
     match Message::decode(data) {
         // Connection greetings are consumed by the transport layer and
         // must never reach the protocol dispatcher.
         Some(Message::ConnHello { .. }) => {}
-        Some(ann @ Message::Ann { .. }) => handlers::handle_ann(ctx, src, ann).await,
-        Some(join @ Message::SwarmJoin { .. }) => swarm::handle_join(ctx, src, join).await,
-        Some(Message::SwarmLeave {
-            unix_ts,
-            pubkey,
-            signature,
-        }) => swarm::handle_leave(ctx, unix_ts, &pubkey, &signature),
+        Some(Message::ConnAccept { .. }) => {}
+        Some(ann @ Message::Ann { .. }) => {
+            // Verification, freshness checking, reputation accounting
+            // and routing-table application all live in the trust
+            // handlers; failures are penalized against the connection
+            // address inside the handler.
+            handle_ann(ctx, src, ann).await;
+        }
         Some(Message::TaskBid {
             task_id,
             trust,
@@ -50,96 +38,170 @@ pub(crate) async fn handle_frame(ctx: &Arc<Ctx>, src: &str, data: &[u8]) {
             pubkey,
             signature,
         }) => {
-            // Authenticate the bid before it ever reaches the scheduler; a
-            // bad signature is answered with a reject so an honest consumer
-            // releases its reservation.
-            match handlers::verify_bid(&task_id, trust, consumed, expires_unix, &pubkey, &signature)
-            {
-                Some(from_node) => {
-                    let _ = ctx
-                        .compute
-                        .send(Cmd::Bid {
-                            task_id,
-                            from_node,
-                            from_addr: src.to_string(),
-                            trust,
-                            consumed,
-                            expires_unix,
-                        })
-                        .await;
-                }
-                None => {
-                    // Penalize the connection address, never the claimed
-                    // node id: an invalid signature proves nothing about
-                    // the identity it tries to borrow.
-                    ctx.reputation.lock().await.record_invalid(src);
-                    let _ = send_msg(
-                        ctx,
-                        src,
-                        &Message::TaskReject {
-                            task_id,
-                            reason: "invalid bid signature".to_string(),
-                        },
-                    )
-                    .await;
-                }
+            let Some(bid_node) =
+                verify_bid(&task_id, trust, consumed, expires_unix, &pubkey, &signature)
+            else {
+                ctx.reputation.lock().await.record_invalid(src);
+                return;
+            };
+            if bid_node != Identity::node_id_from_pubkey(&pubkey) {
+                ctx.reputation.lock().await.record_invalid(src);
+                return;
             }
+            let _ = ctx
+                .compute
+                .send(Cmd::Bid {
+                    task_id,
+                    from_node: bid_node,
+                    from_addr: src.to_string(),
+                    trust,
+                    consumed,
+                    expires_unix,
+                })
+                .await;
         }
         Some(Message::TaskAssign {
             task_id,
             command,
             timeout_secs,
+            ram_mb,
+            gpus,
             pubkey,
             signature,
         }) => {
-            // Verify the signature here; the scheduler separately checks
-            // that the signer is the node whose bid was accepted for this
-            // task id, so no unauthenticated party can trigger execution.
-            let payload = Message::assign_signing_payload(&task_id, &command, timeout_secs);
-            let verified =
-                sig_array(&signature).is_some_and(|sig| Identity::verify(&pubkey, &payload, sig));
-            if verified {
-                let from_node = Identity::node_id_from_pubkey(&pubkey);
-                let _ = ctx
-                    .compute
-                    .send(Cmd::Assign {
-                        task_id,
-                        command,
-                        timeout_secs,
-                        from_node,
-                    })
-                    .await;
-            } else {
+            // Authenticate the assignment signature and attribute the
+            // frame to its signer. The scheduler independently binds the
+            // task id to the node whose bid it accepted and enforces the
+            // requested RAM/GPU capacity, so a request this node cannot
+            // serve is refused there with its reservation released.
+            let signer = Identity::node_id_from_pubkey(&pubkey);
+            if !verify_assign(
+                &task_id,
+                &command,
+                timeout_secs,
+                ram_mb,
+                gpus,
+                &pubkey,
+                &signature,
+                &signer,
+            ) {
                 ctx.reputation.lock().await.record_invalid(src);
-                eprintln!("[opennetd] invalid task assignment signature from {src}");
+                return;
             }
+            let _ = ctx
+                .compute
+                .send(Cmd::Assign {
+                    task_id,
+                    command,
+                    timeout_secs,
+                    ram_mb,
+                    gpus,
+                    from_node: signer,
+                })
+                .await;
         }
         Some(Message::TaskAccept { task_id }) => {
-            compute::deliver_event(ctx, &task_id, ComputeEvent::Accepted).await;
+            complete_waiter(ctx, src, &task_id, ComputeEvent::Accepted).await;
         }
         Some(Message::TaskReject { task_id, reason }) => {
-            compute::deliver_event(ctx, &task_id, ComputeEvent::Rejected(reason)).await;
+            complete_waiter(ctx, src, &task_id, ComputeEvent::Rejected(reason)).await;
         }
         Some(Message::TaskResult { task_id, outcome }) => {
-            compute::deliver_event(ctx, &task_id, ComputeEvent::Outcome(outcome)).await;
+            complete_waiter(ctx, src, &task_id, ComputeEvent::Outcome(outcome)).await;
+        }
+        // A billing receipt travels one frame ahead of its task result;
+        // verify the provider signature and stash it under the task id
+        // so the consumer's settle path can countersign it.
+        Some(receipt @ Message::Receipt { .. }) => {
+            let Message::Receipt {
+                task_id,
+                provider_node,
+                billed_secs,
+                charge,
+                outcome_hash,
+                unix_ts,
+                pubkey,
+                signature,
+                ..
+            } = &receipt
+            else {
+                return;
+            };
+            let valid = verify_receipt(
+                task_id,
+                provider_node,
+                *billed_secs,
+                *charge,
+                outcome_hash,
+                *unix_ts,
+                pubkey,
+                signature,
+            )
+            .is_some_and(|signer| signer == *provider_node);
+            if valid {
+                ctx.pending_receipts
+                    .lock()
+                    .await
+                    .insert(task_id.clone(), receipt);
+            } else {
+                ctx.reputation.lock().await.record_invalid(src);
+            }
+        }
+        // A countersigned receipt ack: the consumer accepted our charge
+        // and output — evidence of a completed settlement.
+        Some(ack @ Message::ReceiptAck { .. }) => {
+            let Message::ReceiptAck {
+                task_id,
+                receipt_hash,
+                unix_ts,
+                pubkey,
+                signature,
+                ..
+            } = &ack
+            else {
+                return;
+            };
+            let valid =
+                verify_receipt_ack(task_id, receipt_hash, *unix_ts, pubkey, signature).is_some();
+            if valid {
+                let mut state = ctx.state.lock().await;
+                let _ = state.receipts.record_ack(ack);
+            } else {
+                ctx.reputation.lock().await.record_invalid(src);
+            }
+        }
+        // Swarm frames keep their fully decoded fields: the handlers
+        // re-verify every signed field, so nothing the peer sent may be
+        // dropped before verification.
+        Some(join @ Message::SwarmJoin { .. }) => {
+            swarm::handle_join(ctx, src, join).await;
+        }
+        Some(Message::SwarmLeave {
+            unix_ts,
+            pubkey,
+            signature,
+        }) => {
+            swarm::handle_leave(ctx, unix_ts, &pubkey, &signature).await;
         }
         Some(launch @ Message::ShardLaunch { .. }) => {
-            let _ = swarm::handle_launch(ctx, src, launch).await;
-        }
-        Some(Message::ShardFwd {
-            plan_id,
-            seq,
-            src: from_shard,
-            dst,
-            payload,
-        }) => {
-            swarm::route_fwd(ctx, &plan_id, seq, from_shard, dst, payload).await;
+            if let Err(err) = swarm::handle_launch(ctx, src, launch).await {
+                eprintln!("[dispatch] shard launch from {src} rejected: {err:#}");
+            }
         }
         Some(Message::ShardReady {
             plan_id,
             shard_index,
         }) => {
             swarm::deliver_plan_event(ctx, &plan_id, swarm::PlanEvent::Ready(shard_index)).await;
+        }
+        Some(Message::ShardFwd {
+            plan_id,
+            seq,
+            src,
+            dst,
+            payload,
+        }) => {
+            swarm::route_fwd(ctx, &plan_id, seq, src, dst, payload).await;
         }
         Some(Message::ShardOut {
             plan_id,
@@ -151,7 +213,52 @@ pub(crate) async fn handle_frame(ctx: &Arc<Ctx>, src: &str, data: &[u8]) {
         Some(Message::SwarmDone { plan_id, reason }) => {
             swarm::finish_plan(ctx, &plan_id, &reason).await;
         }
-        None => eprintln!("[opennetd] undecodable frame from {src}"),
+        Some(gossip @ Message::PeerGossip { .. }) => {
+            wan::handle_gossip(ctx, src, gossip).await;
+        }
+        None => {
+            eprintln!("[opennetd] undecodable frame from {src}");
+        }
+    }
+}
+
+/// Complete one consumer waiter, but only for the peer it was booked
+/// with. The connection address we see is the peer's address from our
+/// viewpoint (rewrites and multihoming may change the IP), so only the
+/// listener port is compared — a stray result from a different listener
+/// goes nowhere near the waiter, which is put back for the genuine
+/// reply.
+async fn complete_waiter(
+    ctx: &Arc<crate::daemon::Ctx>,
+    src: &str,
+    task_id: &str,
+    event: ComputeEvent,
+) {
+    let entry = ctx.result_waiters.lock().await.remove(task_id);
+    if let Some((expected, waiter)) = entry {
+        if same_listener(src, &expected) {
+            let _ = waiter.send(event);
+        } else {
+            ctx.result_waiters
+                .lock()
+                .await
+                .insert(task_id.to_string(), (expected, waiter));
+        }
+    }
+}
+
+/// Compare the listener ports of two `tcp:<ip>:<port>` addresses. The
+/// port identifies the peer's listener; the IP legitimately differs
+/// between the advertised address, the dial target and the observed
+/// connection source.
+fn same_listener(src: &str, expected: &str) -> bool {
+    fn port(addr: &str) -> Option<u16> {
+        addr.rsplit_once(':')
+            .and_then(|(_, raw)| raw.parse::<u16>().ok())
+    }
+    match (port(src), port(expected)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -160,109 +267,53 @@ mod tests {
     use super::*;
     use crate::node::state::Mode;
     use crate::testutil::make_ctx;
-    use crate::trust::now_unix;
-    use std::time::Duration;
-
-    /// Forward every inbound frame of a context into the dispatcher,
-    /// mimicking the daemon's receive task.
-    fn pump(ctx: &Arc<Ctx>) -> tokio::task::JoinHandle<()> {
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            while let Some((src, data)) = ctx.transport.recv().await {
-                handle_frame(&ctx, &src, &data).await;
-            }
-        })
-    }
-
-    /// Seed both routing tables so each side sees the other as a verified
-    /// peer with the given trust and capacity points.
-    async fn introduce(consumer: &Arc<Ctx>, provider: &Arc<Ctx>, trust: i64, points: u32) {
-        let provider_addr = provider.transport.local_id();
-        let provider_id = provider.identity.node_id();
-        consumer.dht.lock().await.insert(&provider_addr);
-        consumer.dht.lock().await.apply_ann(
-            &provider_addr,
-            &provider_id,
-            "peer",
-            trust,
-            points,
-            now_unix(),
-        );
-        let consumer_addr = consumer.transport.local_id();
-        let consumer_id = consumer.identity.node_id();
-        provider.dht.lock().await.insert(&consumer_addr);
-        provider.dht.lock().await.apply_ann(
-            &consumer_addr,
-            &consumer_id,
-            "peer",
-            trust,
-            points,
-            now_unix(),
-        );
-    }
 
     #[tokio::test]
     async fn bid_with_invalid_signature_is_rejected() {
-        let (consumer, _rx1) = make_ctx("dp-consumer").await;
-        let (provider, _rx2) = make_ctx("dp-provider").await;
-        introduce(&consumer, &provider, 100, 20).await;
-        let pump = pump(&provider);
-
-        let bad_bid = Message::TaskBid {
-            task_id: "t-bad".into(),
-            trust: 100,
-            consumed: 0,
-            expires_unix: now_unix() + 300,
-            pubkey: consumer.identity.pubkey(),
-            signature: vec![0u8; 64],
+        let (ctx, mut rx) = make_ctx("dp-bad-bid").await;
+        let bid = Message::TaskBid {
+            task_id: "t1".into(),
+            trust: 50,
+            consumed: 20,
+            expires_unix: 9_999_999_999,
+            pubkey: [7; 32],
+            signature: vec![8; 64],
         };
-        consumer
-            .transport
-            .send(&provider.transport.local_id(), bad_bid.encode().into())
-            .await
-            .unwrap();
-        let (_src, data) = tokio::time::timeout(Duration::from_secs(5), consumer.transport.recv())
-            .await
-            .expect("no reply to bad bid")
-            .expect("transport closed");
-        match Message::decode(&data) {
-            Some(Message::TaskReject { task_id, .. }) => assert_eq!(task_id, "t-bad"),
-            other => panic!("expected TaskReject, got {other:?}"),
-        }
-        pump.abort();
+        handle_frame(&ctx, "tcp:10.9.9.9:5555", &bid.encode()).await;
+        assert_eq!(
+            ctx.reputation.lock().await.score_of("tcp:10.9.9.9:5555"),
+            -1
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no scheduler command may be produced"
+        );
     }
 
     #[tokio::test]
-    async fn signed_swarm_offer_updates_the_routing_table() {
-        let (joiner, _rx1) = make_ctx("dp-joiner").await;
-        let (host, _rx2) = make_ctx("dp-host").await;
-        let pump = pump(&host);
-        // Discovery seeds the joiner's address before the signed offer
-        // arrives, mirroring the real HELLO-then-SwarmJoin order.
-        let joiner_addr = joiner.transport.local_id();
-        host.dht.lock().await.insert(&joiner_addr);
-        let unix_ts = now_unix();
-        let payload = Message::swarm_signing_payload("demo", 4096, 8, unix_ts);
-        let join = Message::SwarmJoin {
-            program: "demo".into(),
-            max_shard_ram_mb: 4096,
-            cpu_cores: 8,
-            unix_ts,
-            pubkey: joiner.identity.pubkey(),
-            signature: joiner.identity.sign(&payload).to_vec(),
-        };
-        joiner
-            .transport
-            .send(&host.transport.local_id(), join.encode().into())
+    async fn a_result_from_a_wrong_listener_cannot_complete_the_waiter() {
+        let (ctx, _rx) = make_ctx("dp-waiter-bind").await;
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<ComputeEvent>();
+        ctx.result_waiters
+            .lock()
             .await
-            .unwrap();
-        // Give the dispatcher a moment, then verify the offer landed.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let candidates = host.dht.lock().await.swarm_candidates("demo");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].node_id, joiner.identity.node_id());
-        assert_eq!(candidates[0].swarm_ram_mb, 4096);
-        pump.abort();
+            .insert("t1".to_string(), ("tcp:10.1.1.1:7000".to_string(), tx));
+        let result = Message::TaskResult {
+            task_id: "t1".into(),
+            outcome: crate::compute::TaskOutcome {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                billed_secs: 1,
+            },
+        };
+        // A different listener port: the waiter must survive.
+        handle_frame(&ctx, "tcp:10.9.9.9:7999", &result.encode()).await;
+        assert!(rx.try_recv().is_err());
+        assert!(ctx.result_waiters.lock().await.contains_key("t1"));
+        // The booked listener completes it.
+        handle_frame(&ctx, "tcp:172.16.0.5:7000", &result.encode()).await;
+        assert!(rx.try_recv().is_ok());
     }
 
     #[tokio::test]
@@ -272,10 +323,11 @@ mod tests {
         assert_eq!(ctx.state.lock().await.msgs_received, 1);
     }
 
-    #[tokio::test]
-    async fn mode_parse_roundtrips_through_the_wire_names() {
+    #[test]
+    fn mode_parse_roundtrips_through_the_wire_names() {
         assert_eq!(Mode::parse("peer").unwrap(), Mode::Peer);
-        assert_eq!(Mode::parse("seed").unwrap().as_str(), "seed");
-        assert!(Mode::parse("bogus").is_err());
+        assert_eq!(Mode::parse("seed").unwrap(), Mode::Seed);
+        assert_eq!(Mode::parse("leech").unwrap(), Mode::Leech);
+        assert!(Mode::parse("relay").is_err());
     }
 }

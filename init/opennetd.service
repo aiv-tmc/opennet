@@ -15,6 +15,10 @@ User=opennet
 Group=opennet
 Restart=on-failure
 RestartSec=2
+# Graceful shutdown budget: the scheduler drains running tasks for at
+# most 30 seconds, then the daemon persists state and exits; 60
+# seconds leaves room for swarm plan teardown plus the drain.
+TimeoutStopSec=60
 # Delegate a cgroup subtree so the daemon can create per-task cgroups.
 Delegate=yes
 

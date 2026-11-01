@@ -11,32 +11,18 @@
 //! * allocation costs that are not part of the measured operation (string
 //!   formatting for queue ids) are prepared outside the timed loop.
 //!
-//! Delete stale baselines (`rm -rf target/criterion`) before reading
-//! `change:` lines — comparisons against baselines recorded under a
-//! different config or machine load are meaningless.
-//!
-//! The suite measures:
-//!
-//! * wire message encoding and decoding (postcard roundtrips of the signed
-//!   announcement, used as the template for every signed frame);
-//! * ed25519 signing and verification of announcement payloads, which the
-//!   heartbeat pays every round per peer;
-//! * routing table operations at 1024 peers;
-//! * trust accounting — reserve/release are in-memory by design, the
-//!   settle benchmark measures the real persistence cost;
-//! * the accepted-bid priority queue;
-//! * a full loopback transport roundtrip with a pre-encoded frame.
-//!
+//! The suite measures wire message encode/decode, ed25519 sign/verify,
+//! routing table operations at 1024 peers, trust accounting, the
+//! accepted-bid priority queue and a loopback transport roundtrip.
 //! Results land in `target/criterion`; record a fresh baseline with
-//! `cargo bench --bench bench -- --save-baseline main` after any code
-//! change you intend to compare.
+//! `cargo bench --bench bench -- --save-baseline main`.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use opennet::compute::queue::{BidQueue, QueuedBid};
 use opennet::dht::Dht;
 use opennet::message::Message;
 use opennet::node::identity::Identity;
-use opennet::node::state::{Mode, NodeState};
+use opennet::node::state::{genesis_head, Mode, NodeState};
 use opennet::transport::Transport;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -50,8 +36,8 @@ fn fast_criterion() -> Criterion {
 }
 
 /// Fresh scratch directory for one benchmark tag: pid plus a random
-/// component, so a stale directory from an earlier run (maybe created by
-/// another user) can never shadow the current measurement.
+/// component, so a stale directory from an earlier run can never
+/// shadow the current measurement.
 fn bench_dir(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "opennet-bench-{tag}-{}-{:08x}",
@@ -65,13 +51,21 @@ fn sample_ann(identity: &Identity) -> Message {
     let node_id = identity.node_id();
     let unix_ts = opennet::trust::now_unix();
     let signature = identity.sign(&Message::ann_signing_payload(
-        &node_id, "peer", 100, 44, unix_ts,
+        &node_id,
+        "peer",
+        100,
+        44,
+        0,
+        &genesis_head(),
+        unix_ts,
     ));
     Message::Ann {
         node_id,
         mode: "peer".into(),
         trust: 100,
         points: 44,
+        gpus: 0,
+        receipt_head: genesis_head(),
         unix_ts,
         pubkey: identity.pubkey(),
         signature: signature.to_vec(),
@@ -93,6 +87,8 @@ fn bench_message(c: &mut Criterion) {
                 black_box("task-0123456789abcdef"),
                 black_box("echo hello && uname -a"),
                 black_box(300),
+                black_box(0),
+                black_box(0),
             ));
         })
     });
@@ -100,7 +96,15 @@ fn bench_message(c: &mut Criterion) {
 
 fn bench_signatures(c: &mut Criterion) {
     let identity = Identity::load_or_create(&bench_dir("sign")).expect("identity");
-    let payload = Message::ann_signing_payload(&identity.node_id(), "peer", 100, 44, 1_700_000_000);
+    let payload = Message::ann_signing_payload(
+        &identity.node_id(),
+        "peer",
+        100,
+        44,
+        0,
+        &genesis_head(),
+        1_700_000_000,
+    );
     c.bench_function("ed25519_sign_ann", |b| {
         b.iter(|| black_box(identity.sign(black_box(&payload))));
     });
@@ -172,6 +176,7 @@ fn bench_state(c: &mut Criterion) {
         min_trust: 0,
         points_per_core: 10,
         points_per_gb: 2,
+        new_node_units_factor: 2,
     };
     let mut state = NodeState::load(&dir, Mode::Peer, limits, &trust_cfg).expect("state");
 
@@ -186,8 +191,7 @@ fn bench_state(c: &mut Criterion) {
         })
     });
 
-    // Sanity gate before measuring: settlement MUST persist to disk. If
-    // this fails, every measured number below is fiction.
+    // Sanity gate before measuring: settlement MUST persist to disk.
     state.reserve("warmup", 5, 0).unwrap();
     state.settle("warmup", 0);
     assert!(
@@ -195,26 +199,22 @@ fn bench_state(c: &mut Criterion) {
         "settle must persist state.json"
     );
 
-    // The persistence cost of one settlement (serde + temp write +
-    // rename). Billing zero units keeps the trust coefficient constant
-    // across iterations: billing real units would drain it within ~20
-    // iterations and degrade the benchmark into measuring an early return.
+    // The persistence cost of one settlement. Billing zero units keeps
+    // the trust coefficient constant across iterations.
     c.bench_function("state_settle", |b| {
         let mut counter = 0u64;
         b.iter(|| {
             counter += 1;
             let task = format!("bench-settle-{counter}");
-            let _ = state.reserve(black_box(&task), black_box(5), black_box(0));
-            black_box(state.settle(black_box(&task), black_box(0)));
+            let _ = black_box(state.reserve(black_box(&task), black_box(5), black_box(0)));
+            state.settle(black_box(&task), black_box(0));
+            black_box(());
         })
     });
 }
 
 fn bench_queue(c: &mut Criterion) {
     let mut queue = BidQueue::new();
-    // Task ids are prepared once: the queue does not deduplicate, so a
-    // fixed pool can be reused, and the measurement covers the priority
-    // queue rather than String formatting.
     let ids: Vec<String> = (0..1000).map(|i| format!("t-{i}")).collect();
     c.bench_function("queue_push_pop_1000", |b| {
         b.iter(|| {
@@ -234,13 +234,20 @@ fn bench_queue(c: &mut Criterion) {
 fn bench_transport(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let a = runtime
-        .block_on(Transport::new(0, Duration::from_secs(60)))
+        .block_on(Transport::new(
+            Identity::generate(),
+            0,
+            Duration::from_secs(60),
+        ))
         .unwrap();
     let b = runtime
-        .block_on(Transport::new(0, Duration::from_secs(60)))
+        .block_on(Transport::new(
+            Identity::generate(),
+            0,
+            Duration::from_secs(60),
+        ))
         .unwrap();
     let dest = b.local_id();
-    // Encoding is benchmarked separately; here the wire bytes are fixed.
     let frame: bytes::Bytes = Message::TaskAccept {
         task_id: "bench".into(),
     }

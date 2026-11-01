@@ -19,6 +19,7 @@ use crate::compute::ComputeEvent;
 use crate::config::Config;
 use crate::daemon::Ctx;
 use crate::dht::Dht;
+use crate::message::Message;
 use crate::node::identity::Identity;
 use crate::node::state::NodeState;
 use crate::reputation::RepTable;
@@ -75,19 +76,20 @@ pub async fn make_ctx(tag: &str) -> (Arc<Ctx>, mpsc::Receiver<Cmd>) {
         config.sandbox.namespaces = false;
         config.sandbox.cgroup = false;
     }
+    let identity = Identity::load_or_create(&dir).expect("cannot create identity");
     let transport = Arc::new(
-        Transport::new(0, Duration::from_secs(60))
+        Transport::new(identity.clone(), 0, Duration::from_secs(60))
             .await
             .expect("cannot bind loopback transport"),
     );
-    let identity = Identity::load_or_create(&dir).expect("cannot create identity");
     let state = Arc::new(Mutex::new(
         NodeState::load(&dir, config.mode, config.limits.clone(), &config.trust)
             .expect("cannot load state"),
     ));
     let (compute_tx, compute_rx) = mpsc::channel::<Cmd>(256);
     let (shutdown, _shutdown_rx) = watch::channel(false);
-    let waiters: HashMap<String, tokio::sync::oneshot::Sender<ComputeEvent>> = HashMap::new();
+    let waiters: HashMap<String, (String, tokio::sync::oneshot::Sender<ComputeEvent>)> =
+        HashMap::new();
     let ctx = Arc::new(Ctx {
         config: config.clone(),
         identity,
@@ -99,6 +101,7 @@ pub async fn make_ctx(tag: &str) -> (Arc<Ctx>, mpsc::Receiver<Cmd>) {
         )),
         compute: compute_tx,
         result_waiters: Arc::new(Mutex::new(waiters)),
+        pending_receipts: Arc::new(Mutex::new(HashMap::<String, Message>::new())),
         swarm: Arc::new(Mutex::new(Consent::load(&dir, &config.swarm))),
         swarm_plans: Arc::new(Mutex::new(HashMap::<String, PlanState>::new())),
         swarm_procs: Arc::new(Mutex::new(HashMap::<String, ShardProc>::new())),

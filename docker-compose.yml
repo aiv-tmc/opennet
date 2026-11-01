@@ -1,0 +1,66 @@
+# Two-node OpenNet demo: the seed accumulates trust, the peer requests
+# work from it. Bring the stack up with:
+#
+#     docker compose up -d
+#     docker compose exec peer opennetctl status
+#     docker compose exec peer opennetctl peers
+#     docker compose exec peer opennetctl compute - 'uname -a'
+#
+# Both services share the host network so LAN multicast discovery works
+# between the containers and with any bare-metal node on the network.
+# For a single-host quick look `network_mode: host` can be replaced by
+# an explicit port mapping, at the cost of losing discovery.
+
+services:
+  seed:
+    build: .
+    image: opennet:local
+    container_name: opennet-seed
+    # The daemon needs CAP_SYS_ADMIN for namespace sandboxing; `privileged`
+    # is the blunt instrument, the fine-grained alternative is:
+    #   cap_add: [SYS_ADMIN, NET_ADMIN, MKNOD]
+    #   cgroup: host
+    privileged: true
+    network_mode: host
+    volumes:
+      - seed-state:/var/lib/opennet
+      - ./docker/seed.toml:/etc/opennet/config.toml:ro
+    restart: unless-stopped
+
+  peer:
+    build: .
+    image: opennet:local
+    container_name: opennet-peer
+    privileged: true
+    network_mode: host
+    volumes:
+      - peer-state:/var/lib/opennet
+      - ./docker/peer.toml:/etc/opennet/config.toml:ro
+    restart: unless-stopped
+    depends_on:
+      - seed
+
+  # Uncomment for a GPU donor node. Requires the NVIDIA container
+  # toolkit on the host; the shard runner and compute tasks receive
+  # CUDA_VISIBLE_DEVICES pinned by the scheduler.
+  #
+  # gpu:
+  #   build: .
+  #   image: opennet:local
+  #   container_name: opennet-gpu
+  #   privileged: true
+  #   network_mode: host
+  #   volumes:
+  #     - gpu-state:/var/lib/opennet
+  #     - ./docker/gpu.toml:/etc/opennet/config.toml:ro
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+
+volumes:
+  seed-state:
+  peer-state:

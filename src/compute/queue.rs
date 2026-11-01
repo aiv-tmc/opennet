@@ -1,32 +1,31 @@
-//! Expiring priority queue of accepted bids awaiting assignment.
-//!
-//! Bids are ordered by reservation size, highest first, with earlier
-//! expiry as the tiebreaker so the most valuable and the most urgent
-//! work is served first. Expired entries are skipped on pop and dropped
-//! by periodic purges.
+//! Scheduling queues: the accepted-bid priority queue (highest units
+//! first, soonest expiry first on ties) and the pending-launch heap
+//! (highest reservation first, FIFO on ties). All ordering happens
+//! through `Ord` implementations, so the scheduler never re-sorts
+//! explicitly.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-/// One accepted bid waiting for its task assignment.
-#[derive(Debug, Clone, Eq, PartialEq)]
+use crate::compute::Launch;
+
+/// One accepted bid in the priority queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedBid {
-    /// Unique identifier of the task.
     pub task_id: String,
-    /// Trust units reserved for this task.
     pub units: i64,
-    /// Unix time after which the bid may be discarded.
     pub expires_unix: u64,
 }
 
 impl Ord for QueuedBid {
-    /// BinaryHeap pops the greatest element: order by units descending and,
-    /// for equal units, by expiry ascending so the soonest-expiring bid of
-    /// the same price is served first.
     fn cmp(&self, other: &Self) -> Ordering {
+        // Max-heap by units: the most valuable bid pops first. Ties
+        // break by expiry (sooner expiry first), then by task id so the
+        // order stays total and deterministic.
         self.units
             .cmp(&other.units)
             .then_with(|| other.expires_unix.cmp(&self.expires_unix))
+            .then_with(|| other.task_id.cmp(&self.task_id))
     }
 }
 
@@ -36,49 +35,52 @@ impl PartialOrd for QueuedBid {
     }
 }
 
-/// Priority queue of accepted bids keyed by task id.
+/// Priority queue of accepted bids.
 pub struct BidQueue {
     heap: BinaryHeap<QueuedBid>,
 }
 
-impl Default for BidQueue {
-    /// An empty queue, identical to `BidQueue::new`.
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl BidQueue {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> BidQueue {
+        BidQueue {
             heap: BinaryHeap::new(),
         }
     }
 
-    /// Insert one accepted bid.
+    /// Queue one accepted bid.
     pub fn push(&mut self, bid: QueuedBid) {
         self.heap.push(bid);
     }
 
-    /// Remove the bid of one task id; used when an assignment supersedes
-    /// the queue entry.
-    pub fn remove(&mut self, task_id: &str) {
-        self.heap.retain(|bid| bid.task_id != task_id);
-    }
-
-    /// Pop the highest-priority bid that has not expired at `now`.
-    pub fn pop_fresh(&mut self, now: u64) -> Option<QueuedBid> {
+    /// Pop the most valuable bid that has not expired; expired entries
+    /// are discarded silently.
+    pub fn pop_fresh(&mut self, now_unix: u64) -> Option<QueuedBid> {
         while let Some(bid) = self.heap.pop() {
-            if bid.expires_unix > now {
+            if bid.expires_unix > now_unix {
                 return Some(bid);
             }
         }
         None
     }
 
-    /// Drop every bid whose expiry has passed at `now`.
-    pub fn purge_expired(&mut self, now: u64) {
-        self.heap.retain(|bid| bid.expires_unix > now);
+    /// Remove one task id (its assignment arrived or was rejected).
+    pub fn remove(&mut self, task_id: &str) {
+        let bids: Vec<QueuedBid> = self
+            .heap
+            .drain()
+            .filter(|bid| bid.task_id != task_id)
+            .collect();
+        self.heap = bids.into();
+    }
+
+    /// Drop all expired entries.
+    pub fn purge_expired(&mut self, now_unix: u64) {
+        let bids: Vec<QueuedBid> = self
+            .heap
+            .drain()
+            .filter(|bid| bid.expires_unix > now_unix)
+            .collect();
+        self.heap = bids.into();
     }
 
     /// Number of queued bids.
@@ -86,9 +88,51 @@ impl BidQueue {
         self.heap.len()
     }
 
-    /// Whether the queue holds no bids.
+    /// True when no bids are queued.
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
+    }
+}
+
+impl Default for BidQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One launch parked in the pending heap, waiting for a free executor
+/// slot. Ordered by reservation size descending; equal reservations pop
+/// in insertion order (FIFO) via a monotonically increasing counter.
+#[derive(Clone, Debug)]
+pub struct PendingLaunch {
+    pub units: i64,
+    pub order: u64,
+    pub from_node: String,
+    pub launch: Launch,
+}
+
+impl PartialEq for PendingLaunch {
+    fn eq(&self, other: &Self) -> bool {
+        self.units == other.units && self.order == other.order
+    }
+}
+
+impl Eq for PendingLaunch {}
+
+impl Ord for PendingLaunch {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Max-heap by units, FIFO on ties: the counter is assigned at
+        // insertion time, so a smaller counter means "inserted earlier"
+        // and must pop first.
+        self.units
+            .cmp(&other.units)
+            .then_with(|| other.order.cmp(&self.order))
+    }
+}
+
+impl PartialOrd for PendingLaunch {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -97,28 +141,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn highest_units_win_and_expired_entries_are_skipped() {
+    fn higher_units_pop_first() {
         let mut queue = BidQueue::new();
         queue.push(QueuedBid {
-            task_id: "cheap".into(),
+            task_id: "small".into(),
             units: 5,
             expires_unix: 1000,
         });
         queue.push(QueuedBid {
-            task_id: "rich".into(),
+            task_id: "big".into(),
             units: 50,
-            expires_unix: 900,
+            expires_unix: 1000,
         });
+        let first = queue.pop_fresh(0).expect("queue empty");
+        assert_eq!(first.task_id, "big");
+    }
+
+    #[test]
+    fn expired_bids_are_skipped() {
+        let mut queue = BidQueue::new();
         queue.push(QueuedBid {
-            task_id: "stale".into(),
-            units: 99,
+            task_id: "old".into(),
+            units: 100,
             expires_unix: 10,
         });
-        let first = queue.pop_fresh(500).expect("queue empty");
-        assert_eq!(first.task_id, "rich");
-        let second = queue.pop_fresh(500).expect("queue empty");
-        assert_eq!(second.task_id, "cheap");
-        assert!(queue.pop_fresh(500).is_none());
+        queue.push(QueuedBid {
+            task_id: "fresh".into(),
+            units: 1,
+            expires_unix: 1000,
+        });
+        let first = queue.pop_fresh(50).expect("queue empty");
+        assert_eq!(first.task_id, "fresh");
+        assert!(queue.pop_fresh(50).is_none());
     }
 
     #[test]
@@ -132,14 +186,14 @@ mod tests {
         queue.push(QueuedBid {
             task_id: "sooner".into(),
             units: 10,
-            expires_unix: 800,
+            expires_unix: 100,
         });
-        assert_eq!(queue.pop_fresh(500).unwrap().task_id, "sooner");
-        assert_eq!(queue.pop_fresh(500).unwrap().task_id, "later");
+        let first = queue.pop_fresh(50).expect("queue empty");
+        assert_eq!(first.task_id, "sooner");
     }
 
     #[test]
-    fn remove_drops_only_the_matching_bid() {
+    fn remove_drops_only_the_named_bid() {
         let mut queue = BidQueue::new();
         queue.push(QueuedBid {
             task_id: "a".into(),
@@ -157,19 +211,38 @@ mod tests {
     }
 
     #[test]
-    fn purge_expired_drops_stale_bids_only() {
-        let mut queue = BidQueue::new();
-        queue.push(QueuedBid {
-            task_id: "old".into(),
-            units: 1,
-            expires_unix: 10,
+    fn pending_launches_pop_highest_units_first_and_fifo_on_ties() {
+        let launch = |task_id: &str| Launch {
+            task_id: task_id.to_string(),
+            return_addr: "tcp:127.0.0.1:1".into(),
+            from_node: "consumer".into(),
+            units: 0,
+            command: "echo".into(),
+            timeout_secs: 60,
+            ram_mb: 0,
+            gpus: Vec::new(),
+        };
+        let mut heap = BinaryHeap::new();
+        heap.push(PendingLaunch {
+            units: 5,
+            order: 1,
+            from_node: "n1".into(),
+            launch: launch("cheap-1"),
         });
-        queue.push(QueuedBid {
-            task_id: "new".into(),
-            units: 2,
-            expires_unix: 1000,
+        heap.push(PendingLaunch {
+            units: 50,
+            order: 2,
+            from_node: "n2".into(),
+            launch: launch("expensive"),
         });
-        queue.purge_expired(500);
-        assert_eq!(queue.len(), 1);
+        heap.push(PendingLaunch {
+            units: 5,
+            order: 3,
+            from_node: "n3".into(),
+            launch: launch("cheap-2"),
+        });
+        assert_eq!(heap.pop().unwrap().launch.task_id, "expensive");
+        assert_eq!(heap.pop().unwrap().launch.task_id, "cheap-1");
+        assert_eq!(heap.pop().unwrap().launch.task_id, "cheap-2");
     }
 }

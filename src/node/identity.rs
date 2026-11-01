@@ -10,11 +10,23 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 /// Node identity able to sign wire messages and derive the public node id.
+///
+/// Cloning is cheap (the 32-byte secret key is copied) and lets every
+/// connection-owning task hold its own handle for handshake signing.
+#[derive(Clone)]
 pub struct Identity {
     signing_key: SigningKey,
 }
 
 impl Identity {
+    /// Generate a fresh in-memory identity; used by tests and benchmarks
+    /// that need a signing key without persisting one.
+    pub fn generate() -> Self {
+        Self {
+            signing_key: SigningKey::generate(&mut rand::rngs::OsRng),
+        }
+    }
+
     /// Load the 32-byte secret key from `<state_dir>/node.key` or generate a
     /// fresh ed25519 keypair and store it with mode 0600.
     ///
@@ -124,5 +136,15 @@ mod tests {
         ));
         let foreign = Identity::load_or_create(&scratch_dir("id-foreign")).unwrap();
         assert!(!Identity::verify(&foreign.pubkey(), payload, &signature));
+    }
+
+    #[test]
+    fn generated_identities_sign_and_verify() {
+        let first = Identity::generate();
+        let second = Identity::generate();
+        assert_ne!(first.node_id(), second.node_id());
+        let signature = first.sign(b"payload");
+        assert!(Identity::verify(&first.pubkey(), b"payload", &signature));
+        assert!(!Identity::verify(&second.pubkey(), b"payload", &signature));
     }
 }
