@@ -1,212 +1,68 @@
-# Continuous integration for OpenNet.
-#
-# Every push and pull request is checked for formatting, lint cleanliness,
-# passing tests and a successful release build. A smoke job additionally
-# boots the real daemon with a temporary configuration and drives it
-# through the control socket, so regressions in startup, state handling
-# and shutdown are caught before they reach a release.
+# Continuous integration: every pull request and push to main must pass
+# the full release gate (format, clippy with warnings denied, the
+# complete release-mode test suite, dependency audit) plus a two-node
+# smoke job that boots two real daemons on loopback and executes a task
+# across them — the cheapest end-to-end proof the market works.
 
-name: CI
+name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+  schedule:
+    # Nightly: keep the smoke test green even without commits.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Static quality gate: the tree must be rustfmt-clean and clippy-clean
-  # with warnings denied, matching the contribution requirements.
-  quality:
-    name: Format and lint
+  gate:
+    name: fmt + clippy + test + audit
     runs-on: ubuntu-latest
     steps:
-      - name: Check out the repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install the stable toolchain with rustfmt and clippy
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Cache compiled dependencies between runs
-        uses: Swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@v2
 
-      - name: Verify rustfmt-clean tree
+      - name: Format
         run: cargo fmt --all -- --check
 
-      - name: Verify clippy-clean tree (warnings are errors)
+      - name: Clippy (warnings are errors)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-  # The test suite exercises the trust economy, the transport, the executor
-  # and end-to-end market flows over real loopback TCP. Linux is the
-  # primary platform; macOS is included to catch portability regressions
-  # (the code intentionally avoids Linux-only APIs at runtime).
-  test:
-    name: Tests (${{ matrix.os }})
-    needs: quality
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Check out the repository
-        uses: actions/checkout@v4
+      - name: Test (release mode)
+        run: cargo test --release --locked
 
-      - name: Install the stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Dependency audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
 
-      - name: Cache compiled dependencies between runs
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run the full test suite
-        run: cargo test --all-features --verbose
-
-  # The release profile uses LTO and codegen-units=1, which is a different
-  # code path than the dev profile; build it explicitly so a broken release
-  # build never reaches the release workflow.
-  build:
-    name: Release build
-    needs: quality
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out the repository
-        uses: actions/checkout@v4
-
-      - name: Install the stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache compiled dependencies between runs
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build with the release profile
-        run: cargo build --release --verbose
-
-      - name: Upload the binaries as a workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: opennet-binaries-${{ github.sha }}
-          path: |
-            target/release/opennetd
-            target/release/opennetctl
-          if-no-files-found: error
-
-  # Boot the real daemon with a scratch configuration and drive it through
-  # the control socket: status must report the genesis trust, shutdown must
-  # stop the process cleanly and the state file must persist afterwards.
-  # The daemon output is captured to a log and printed on any failure so a
-  # crash before socket creation is diagnosable from the job log alone.
   smoke:
-    name: Daemon smoke test
-    needs: build
+    name: two-node smoke
     runs-on: ubuntu-latest
+    needs: gate
     steps:
-      - name: Check out the repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install the stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache compiled dependencies between runs
-        uses: Swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@v2
 
-      - name: Build the daemon and the control client
-        run: cargo build --release
+      - name: Build release binaries
+        run: cargo build --release --locked
 
-      - name: Create a scratch configuration with temporary paths
-        run: |
-          mkdir -p /tmp/opennet-smoke
-          ./target/release/opennetd --print-default-config > /tmp/opennet-smoke/config.toml
-          sed -i 's|/var/lib/opennet|/tmp/opennet-smoke/state|' /tmp/opennet-smoke/config.toml
-          sed -i 's|/run/opennet/control.sock|/tmp/opennet-smoke/control.sock|' /tmp/opennet-smoke/config.toml
-          cat /tmp/opennet-smoke/config.toml
-
-      - name: Start the daemon in the background
-        run: |
-          ./target/release/opennetd --config /tmp/opennet-smoke/config.toml \
-            > /tmp/opennet-smoke/daemon.log 2>&1 &
-          echo $! > /tmp/opennet-smoke/daemon.pid
-
-      - name: Wait for the control socket to appear
-        run: |
-          for attempt in $(seq 1 30); do
-            if [ -S /tmp/opennet-smoke/control.sock ]; then
-              exit 0
-            fi
-            if ! kill -0 "$(cat /tmp/opennet-smoke/daemon.pid)" 2>/dev/null; then
-              echo "daemon exited before creating the control socket" >&2
-              cat /tmp/opennet-smoke/daemon.log >&2
-              exit 1
-            fi
-            sleep 1
-          done
-          echo "control socket never appeared" >&2
-          cat /tmp/opennet-smoke/daemon.log >&2
-          exit 1
-
-      - name: Query the node status through the control socket
-        env:
-          OPENNET_SOCKET: /tmp/opennet-smoke/control.sock
-        run: |
-          status=$(./target/release/opennetctl status)
-          echo "$status"
-          grep -q "mode: peer" <<<"$status"
-          grep -q "trust: 100" <<<"$status"
-          grep -q "consumed: 0" <<<"$status"
-
-      - name: Shut the daemon down gracefully via the control socket
-        env:
-          OPENNET_SOCKET: /tmp/opennet-smoke/control.sock
-        run: |
-          ./target/release/opennetctl shutdown
-          # PID-based liveness checks are unreliable here: the orphaned
-          # daemon turns into an unreaped zombie and its pid may be reused
-          # while kill -0 keeps succeeding. Probe the control socket
-          # instead: once the daemon exits, connecting to the stale socket
-          # file fails with ECONNREFUSED.
-          for attempt in $(seq 1 15); do
-            if ! OPENNET_SOCKET=/tmp/opennet-smoke/control.sock \
-              ./target/release/opennetctl status >/dev/null 2>&1; then
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "daemon ignored the shutdown command" >&2
-          cat /tmp/opennet-smoke/daemon.log >&2
-          exit 1
-
-      - name: Verify the state file was persisted
-        run: test -f /tmp/opennet-smoke/state/state.json
-
-  # Audit the dependency tree against the RustSec advisory database. The
-  # lockfile is generated on the fly when it is not committed yet, so the
-  # job works in both repository states; committing Cargo.lock pins the
-  # audited versions to the ones the release builds use. Publishing the
-  # result as a check run needs the checks:write permission, and pull
-  # requests from forks cannot receive check runs at all, so the job is
-  # skipped there.
-  audit:
-    name: Security audit
-    needs: quality
-    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
-    permissions:
-      checks: write
-      contents: read
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out the repository
-        uses: actions/checkout@v4
-
-      - name: Install the stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Generate the lockfile when it is not committed yet
-        run: cargo generate-lockfile
-
-      - name: Run the advisory audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # The smoke script starts two daemons on loopback: a seed and a
+      # peer that reaches it through the WAN seed path (deterministic
+      # in containers where multicast may be unavailable), runs a task
+      # across the market, and asserts the settlement end to end.
+      - name: Run the two-node smoke scenario
+        run: sudo bash scripts/smoke.sh ./target/release/opennetd ./target/release/opennetctl
