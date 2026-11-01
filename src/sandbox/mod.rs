@@ -28,7 +28,9 @@ mod linux {
     use std::path::Path;
     use tokio::process::Command;
 
-    /// Isolation is unavailable: the pre-exec hook is a no-op.
+    /// Isolation is unavailable on this platform: the pre-exec hook is
+    /// a no-op, so the child still runs with the working directory and
+    /// environment the caller configured.
     pub fn apply(
         _command: &mut Command,
         _workdir: &Path,
@@ -42,7 +44,8 @@ mod linux {
     pub struct CgroupGuard;
 
     impl CgroupGuard {
-        /// Always returns `None`: there is no cgroup v2 to attach to.
+        /// Always returns `None`: there is no cgroup v2 to attach to,
+        /// so callers run the child without limits.
         pub fn attach(
             _name: &str,
             _pid: u32,
@@ -53,8 +56,15 @@ mod linux {
             None
         }
 
-        /// No-op teardown.
+        /// No-op teardown, kept for parity with the Linux guard so the
+        /// two implementations expose the same surface.
         pub fn teardown(&self) {}
+    }
+
+    impl Drop for CgroupGuard {
+        fn drop(&mut self) {
+            self.teardown();
+        }
     }
 }
 
@@ -76,8 +86,10 @@ pub const TASK_UNSHARE_FLAGS: libc::c_int = libc::CLONE_NEWNS
 pub const RUNNER_UNSHARE_FLAGS: libc::c_int =
     libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC | libc::CLONE_NEWPID;
 
-/// Apply the full task isolation profile to `command`: namespaces,
-/// read-only root, private tmpfs scratch space and environment scrub.
+/// Apply the full task isolation profile to `command`: on Linux the
+/// namespace/tmpfs/read-only-root pre-exec hook; elsewhere the
+/// platform no-op, so the command still spawns with the caller's
+/// working directory and environment.
 pub fn apply_to_command(
     command: &mut Command,
     workdir: &Path,
@@ -87,11 +99,12 @@ pub fn apply_to_command(
     #[cfg(target_os = "linux")]
     linux::apply(command, workdir, cfg, inherit_memory_mb, TASK_UNSHARE_FLAGS);
     #[cfg(not(target_os = "linux"))]
-    let _ = (command, workdir, cfg, inherit_memory_mb);
+    linux::apply(command, workdir, cfg, inherit_memory_mb, 0);
 }
 
 /// Apply the swarm runner isolation profile to `command`: the same
-/// namespaces and limits, but without the private network namespace.
+/// profile minus the private network namespace on Linux, the platform
+/// no-op elsewhere.
 pub fn apply_to_runner(
     command: &mut Command,
     workdir: &Path,
@@ -107,7 +120,7 @@ pub fn apply_to_runner(
         RUNNER_UNSHARE_FLAGS,
     );
     #[cfg(not(target_os = "linux"))]
-    let _ = (command, workdir, cfg, inherit_memory_mb);
+    linux::apply(command, workdir, cfg, inherit_memory_mb, 0);
 }
 
 /// One human-readable sandbox capability line for `opennetctl status`:

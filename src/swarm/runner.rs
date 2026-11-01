@@ -151,7 +151,7 @@ pub async fn bridge(
         libc::killpg(pid, libc::SIGKILL)
     };
     #[cfg(not(unix))]
-    let _ = child.start_kill();
+    let _ = (pid, child.start_kill());
     let _ = child.wait().await;
     let _ = std::fs::remove_dir_all(&workdir);
     ctx.swarm_procs
