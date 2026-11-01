@@ -22,13 +22,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
-/// Consumer waiters keyed by task id, each bound to the listener
-/// address the request was booked with: a result frame completes the
-/// waiter only when it arrives from the booked listener (compared by
-/// port — the observed IP may legitimately differ from the advertised
-/// one). Factored into an alias because the full map type is wider
-/// than a field declaration reads well.
+/// Consumer waiters keyed by task id, each bound to the provider node
+/// id the request was booked with. Signed TaskAccept, TaskReject and
+/// TaskResult frames complete a waiter only when the signature verifies
+/// against that exact node id, so a frame injected from an unrelated
+/// connection cannot satisfy an in-flight request.
 pub type ResultWaiters = Arc<Mutex<HashMap<String, (String, oneshot::Sender<ComputeEvent>)>>>;
+
+/// Audit waiters keyed by the hex request id of a ReceiptRequest.
+pub type ReceiptWindows = Arc<Mutex<HashMap<String, oneshot::Sender<Message>>>>;
+
+/// Successful chain audits, keyed by node id with the verified head:
+/// an entry means "this head already verified, skip re-auditing".
+pub type AuditedHeads = Arc<Mutex<HashMap<String, [u8; 32]>>>;
 
 /// Shared daemon context: every subsystem holds one of these and all
 /// cross-subsystem state hangs off it behind its own lock. Fields are
@@ -46,9 +52,12 @@ pub struct Ctx {
     pub swarm_procs: Arc<Mutex<HashMap<String, ShardProc>>>,
     pub result_waiters: ResultWaiters,
     /// Provider-signed billing receipts that arrived one frame ahead
-    /// of their task results, keyed by task id; the consumer's settle
-    /// path drains them.
+    /// of their task results, keyed by task id.
     pub pending_receipts: Arc<Mutex<HashMap<String, Message>>>,
+    /// Pending receipt-window audits, keyed by request id.
+    pub receipt_windows: ReceiptWindows,
+    /// Verified chain heads per node id.
+    pub audited_heads: AuditedHeads,
     pub shutdown: watch::Sender<bool>,
     pub compute: mpsc::Sender<Cmd>,
     pub transport: Arc<Transport>,
@@ -112,6 +121,8 @@ async fn run_async(config: Config, shutdown: watch::Sender<bool>) -> Result<()> 
         swarm_procs: Arc::new(Mutex::new(HashMap::new())),
         result_waiters: Arc::new(Mutex::new(HashMap::new())),
         pending_receipts: Arc::new(Mutex::new(HashMap::new())),
+        receipt_windows: Arc::new(Mutex::new(HashMap::new())),
+        audited_heads: Arc::new(Mutex::new(HashMap::new())),
         shutdown: shutdown.clone(),
         compute: compute_tx,
         transport,
@@ -126,8 +137,9 @@ async fn run_async(config: Config, shutdown: watch::Sender<bool>) -> Result<()> 
     provider::run(ctx.clone(), compute_rx);
     wan::spawn(ctx.clone());
     crate::init::systemd::notify_ready();
-    // Signals raise the same flag as the control-socket `shutdown`
-    // command, so both paths share the identical teardown sequence.
+    // POSIX platforms stop on SIGTERM as well as on the console
+    // interrupt; other platforms only offer the console interrupt.
+    #[cfg(unix)]
     tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -141,8 +153,14 @@ async fn run_async(config: Config, shutdown: watch::Sender<bool>) -> Result<()> 
             let _ = shutdown.send(true);
         }
     });
-    // Frame loop: dispatch every inbound frame until the transport dies
-    // or the shutdown flag fires.
+    #[cfg(not(unix))]
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = shutdown.send(true);
+        }
+    });
     let mut shutdown_rx = shutdown.subscribe();
     loop {
         tokio::select! {
@@ -157,9 +175,6 @@ async fn run_async(config: Config, shutdown: watch::Sender<bool>) -> Result<()> 
             }
         }
     }
-    // Teardown in dependency order: retract swarm consent, tear plans
-    // down, drain the scheduler (bounded), flush reputation, persist
-    // state and remove the control socket.
     swarm::leave::broadcast_leave(&ctx).await;
     swarm::leave::shutdown_plans(&ctx).await;
     ctx.reputation.lock().await.flush();

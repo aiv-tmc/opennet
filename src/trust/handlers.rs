@@ -1,274 +1,380 @@
-//! Verification of signed announcements, swarm offers, task bids,
-//! billing receipts and WAN gossip.
+//! Receipt-journal handlers: the chain audit, the audit window
+//! response builder and the four inbound receipt-related frames.
+//!
+//! The audit demands one signed window of a peer's receipt journal and
+//! recomputes the chaining hash: a consumer announcing trust above the
+//! genesis endowment must present a chain whose recomputed head
+//! matches the announced one, or the bid is refused. Inbound receipts
+//! are only stashed while a consumer request for the same task id is
+//! waiting, which bounds the pending table to live requests.
 
+use super::verify::{
+    verify_receipt, verify_receipt_ack, verify_receipt_request, verify_receipt_response,
+};
 use crate::config::Config;
-use crate::daemon::Ctx;
+use crate::daemon::{send_msg, Ctx};
+use crate::dht::PeerInfo;
 use crate::message::Message;
-use crate::node::identity::Identity;
-use crate::node::state::Mode;
+use crate::node::state::{genesis_head, verify_window, ReceiptLog};
+use anyhow::Result;
 use std::sync::Arc;
+use std::time::Duration;
 
-fn sig_array(signature: &[u8]) -> Option<&[u8; 64]> {
-    signature.try_into().ok()
-}
+/// Cap on receipts per audit window: keeps the response comfortably
+/// inside the 1 MiB frame cap.
+pub const AUDIT_WINDOW_CAP: u32 = 1024;
 
-fn timestamp_fresh(unix_ts: u64, now: u64, max_age_secs: u64, future_skew_secs: u64) -> bool {
-    unix_ts <= now + future_skew_secs && now.saturating_sub(unix_ts) <= max_age_secs
-}
+/// Ten seconds to fetch one audit window; a slow peer fails the audit.
+const AUDIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Verify a signed announcement and apply it to the routing table.
-pub async fn handle_ann(ctx: &Arc<Ctx>, src: &str, ann: Message) {
-    let Message::Ann {
-        node_id,
-        mode,
-        trust,
-        points,
-        gpus,
-        receipt_head,
+/// Re-exported verifiers so long-standing import sites keep working.
+pub use super::verify::{verify_bid, verify_gossip, verify_swarm_join};
+
+/// Build the signed window response for one verified audit request from
+/// the local journal. Returns `None` when the requested anchor is not a
+/// known chain position.
+pub fn build_receipt_response(
+    log: &ReceiptLog,
+    identity: &crate::node::identity::Identity,
+    request_id: [u8; 32],
+    head_before: [u8; 32],
+    limit: u32,
+) -> Option<Message> {
+    let (receipts, head_after, complete) = log.window(head_before, limit as usize)?;
+    let unix_ts = crate::trust::now_unix();
+    Some(Message::ReceiptResponse {
+        signature: identity
+            .sign(&Message::receipt_response_signing_payload(
+                &request_id,
+                &head_before,
+                &receipts,
+                &head_after,
+                complete,
+                unix_ts,
+            ))
+            .to_vec(),
+        request_id,
+        head_before,
+        receipts,
+        head_after,
+        complete,
         unix_ts,
-        pubkey,
-        signature,
-    } = ann
-    else {
-        return;
-    };
-    let payload =
-        Message::ann_signing_payload(&node_id, &mode, trust, points, gpus, &receipt_head, unix_ts);
-    let id_matches = node_id == Identity::node_id_from_pubkey(&pubkey);
-    let mode_valid = Mode::parse(&mode).is_ok();
-    let fresh = timestamp_fresh(
-        unix_ts,
-        crate::trust::now_unix(),
-        ctx.config.network.ann_max_age_secs,
-        ctx.config.network.ann_future_skew_secs,
-    );
-    let signature_valid =
-        sig_array(&signature).is_some_and(|sig| Identity::verify(&pubkey, &payload, sig));
-    if id_matches && mode_valid && fresh && signature_valid {
-        ctx.reputation.lock().await.record_valid(&node_id);
-        ctx.dht.lock().await.apply_ann_ext(
-            src,
-            &node_id,
-            &mode,
-            trust,
-            points,
-            gpus,
-            receipt_head,
-            unix_ts,
-        );
-    } else {
-        ctx.reputation.lock().await.record_invalid(src);
-        eprintln!("[opennetd] invalid announcement from {src}");
-    }
+        pubkey: identity.pubkey(),
+    })
 }
 
-pub fn verify_bid(
-    task_id: &str,
-    trust: i64,
-    consumed: u64,
-    expires_unix: u64,
-    pubkey: &[u8; 32],
-    signature: &[u8],
-) -> Option<String> {
-    let payload = Message::bid_signing_payload(task_id, trust, consumed, expires_unix);
-    let sig = sig_array(signature)?;
-    Identity::verify(pubkey, &payload, sig).then(|| Identity::node_id_from_pubkey(pubkey))
-}
-
-pub fn verify_swarm_join(
-    program: &str,
-    max_shard_ram_mb: u64,
-    cpu_cores: u32,
-    gpus: u32,
-    unix_ts: u64,
-    pubkey: &[u8; 32],
-    signature: &[u8],
-) -> Option<String> {
-    let payload =
-        Message::swarm_signing_payload(program, max_shard_ram_mb, cpu_cores, gpus, unix_ts);
-    let sig = sig_array(signature)?;
-    Identity::verify(pubkey, &payload, sig).then(|| Identity::node_id_from_pubkey(pubkey))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn verify_receipt(
-    task_id: &str,
-    provider_node: &str,
-    billed_secs: u64,
-    charge: i64,
-    outcome_hash: &[u8; 32],
-    unix_ts: u64,
-    pubkey: &[u8; 32],
-    signature: &[u8],
-) -> Option<String> {
-    let payload = Message::receipt_signing_payload(
+/// Handle one inbound signed Receipt: verify the provider signature,
+/// then stash the receipt only while a consumer request for the same
+/// task id is waiting. Receipts for unknown tasks are dropped and
+/// penalized, which bounds the pending table to live requests.
+pub async fn handle_receipt_frame(ctx: &Arc<Ctx>, src: &str, receipt: Message) {
+    let Message::Receipt {
         task_id,
         provider_node,
         billed_secs,
         charge,
         outcome_hash,
         unix_ts,
-    );
-    let sig = sig_array(signature)?;
-    if provider_node != Identity::node_id_from_pubkey(pubkey) {
-        return None;
+        pubkey,
+        signature,
+    } = receipt
+    else {
+        return;
+    };
+    let Some(signer) = verify_receipt(
+        &task_id,
+        &provider_node,
+        billed_secs,
+        charge,
+        &outcome_hash,
+        unix_ts,
+        &pubkey,
+        &signature,
+    ) else {
+        ctx.reputation.lock().await.record_invalid(src);
+        return;
+    };
+    if signer != provider_node {
+        ctx.reputation.lock().await.record_invalid(src);
+        return;
     }
-    Identity::verify(pubkey, &payload, sig).then(|| Identity::node_id_from_pubkey(pubkey))
+    if !ctx.result_waiters.lock().await.contains_key(&task_id) {
+        ctx.reputation.lock().await.record_invalid(src);
+        return;
+    }
+    ctx.pending_receipts.lock().await.insert(
+        task_id.clone(),
+        Message::Receipt {
+            task_id,
+            provider_node,
+            billed_secs,
+            charge,
+            outcome_hash,
+            unix_ts,
+            pubkey,
+            signature,
+        },
+    );
 }
 
-pub fn verify_receipt_ack(
-    task_id: &str,
-    receipt_hash: &[u8; 32],
-    unix_ts: u64,
-    pubkey: &[u8; 32],
-    signature: &[u8],
-) -> Option<String> {
-    let payload = Message::receipt_ack_signing_payload(task_id, receipt_hash, unix_ts);
-    let sig = sig_array(signature)?;
-    Identity::verify(pubkey, &payload, sig).then(|| Identity::node_id_from_pubkey(pubkey))
+/// Handle one inbound signed ReceiptAck: verified acknowledgements are
+/// appended to the provider's local ack journal; anything else is
+/// penalized against the connection address.
+pub async fn handle_receipt_ack_frame(ctx: &Arc<Ctx>, src: &str, ack: Message) {
+    let Message::ReceiptAck {
+        task_id,
+        receipt_hash,
+        unix_ts,
+        pubkey,
+        signature,
+    } = ack
+    else {
+        return;
+    };
+    if verify_receipt_ack(&task_id, &receipt_hash, unix_ts, &pubkey, &signature).is_none() {
+        ctx.reputation.lock().await.record_invalid(src);
+        return;
+    }
+    let _ = ctx
+        .state
+        .lock()
+        .await
+        .receipts
+        .record_ack(Message::ReceiptAck {
+            task_id,
+            receipt_hash,
+            unix_ts,
+            pubkey,
+            signature,
+        });
 }
 
-/// Verify a signed WAN gossip snapshot and return the authenticated
-/// sender node id. The snapshot itself carries no identity claims —
-/// the signature only proves who relayed it.
-pub fn verify_gossip(
-    addrs: &[String],
-    unix_ts: u64,
-    pubkey: &[u8; 32],
-    signature: &[u8],
-) -> Option<String> {
-    let payload = Message::gossip_signing_payload(addrs, unix_ts);
-    let sig = sig_array(signature)?;
-    Identity::verify(pubkey, &payload, sig).then(|| Identity::node_id_from_pubkey(pubkey))
+/// Handle one inbound signed ReceiptRequest: serve one journal window
+/// from the requested anchor back over the transport.
+pub async fn handle_receipt_request_frame(ctx: &Arc<Ctx>, src: &str, request: Message) {
+    let Message::ReceiptRequest {
+        request_id,
+        head_before,
+        limit,
+        unix_ts,
+        pubkey,
+        signature,
+    } = request
+    else {
+        return;
+    };
+    if verify_receipt_request(
+        &request_id,
+        &head_before,
+        limit,
+        unix_ts,
+        &pubkey,
+        &signature,
+    )
+    .is_none()
+    {
+        ctx.reputation.lock().await.record_invalid(src);
+        return;
+    }
+    let response = {
+        let state = ctx.state.lock().await;
+        build_receipt_response(
+            &state.receipts,
+            &ctx.identity,
+            request_id,
+            head_before,
+            limit,
+        )
+    };
+    if let Some(response) = response {
+        let _ = send_msg(ctx, src, &response).await;
+    }
+}
+
+/// Handle one inbound signed ReceiptResponse: deliver it to the audit
+/// waiting on the echoed request id, if any.
+pub async fn handle_receipt_response_frame(ctx: &Arc<Ctx>, src: &str, response: Message) {
+    let Message::ReceiptResponse {
+        request_id,
+        head_before,
+        receipts,
+        head_after,
+        complete,
+        unix_ts,
+        pubkey,
+        signature,
+    } = response
+    else {
+        return;
+    };
+    if verify_receipt_response(
+        &request_id,
+        &head_before,
+        &receipts,
+        &head_after,
+        complete,
+        unix_ts,
+        &pubkey,
+        &signature,
+    )
+    .is_none()
+    {
+        ctx.reputation.lock().await.record_invalid(src);
+        return;
+    }
+    if let Some(waiter) = ctx
+        .receipt_windows
+        .lock()
+        .await
+        .remove(&hex::encode(request_id))
+    {
+        let _ = waiter.send(Message::ReceiptResponse {
+            request_id,
+            head_before,
+            receipts,
+            head_after,
+            complete,
+            unix_ts,
+            pubkey,
+            signature,
+        });
+    }
+}
+
+/// Audit one peer's receipt chain against its announced head. Returns
+/// `Ok(true)` when the chain verifies (or was already audited for this
+/// head), `Ok(false)` on a mismatch and `Err` when the peer cannot be
+/// reached — callers treat `Err` as "audit unavailable, do not block
+/// the market" and `Ok(false)` as "liar, refuse".
+pub async fn audit_chain(ctx: &Arc<Ctx>, peer: &PeerInfo, expected_head: [u8; 32]) -> Result<bool> {
+    {
+        let cache = ctx.audited_heads.lock().await;
+        if cache
+            .get(&peer.node_id)
+            .is_some_and(|head| *head == expected_head)
+        {
+            return Ok(true);
+        }
+    }
+    let request_id: [u8; 32] = rand::random();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Message>();
+    let key = hex::encode(request_id);
+    ctx.receipt_windows.lock().await.insert(key.clone(), tx);
+    let unix_ts = crate::trust::now_unix();
+    let request = Message::ReceiptRequest {
+        signature: ctx
+            .identity
+            .sign(&Message::receipt_request_signing_payload(
+                &request_id,
+                &genesis_head(),
+                AUDIT_WINDOW_CAP,
+                unix_ts,
+            ))
+            .to_vec(),
+        request_id,
+        head_before: genesis_head(),
+        limit: AUDIT_WINDOW_CAP,
+        unix_ts,
+        pubkey: ctx.identity.pubkey(),
+    };
+    let outcome = async {
+        send_msg(ctx, &peer.addr, &request).await?;
+        tokio::time::timeout(AUDIT_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("audit timed out"))?
+            .map_err(|_| anyhow::anyhow!("audit waiter dropped"))
+    }
+    .await;
+    ctx.receipt_windows.lock().await.remove(&key);
+    let Ok(response) = outcome else {
+        return Err(anyhow::anyhow!("audit unavailable"));
+    };
+    let Message::ReceiptResponse {
+        request_id: echoed,
+        head_before,
+        receipts,
+        head_after,
+        complete,
+        unix_ts,
+        pubkey,
+        signature,
+        ..
+    } = response
+    else {
+        return Err(anyhow::anyhow!("not a receipt response"));
+    };
+    if echoed != request_id {
+        return Err(anyhow::anyhow!("stale audit response"));
+    }
+    if verify_receipt_response(
+        &echoed,
+        &head_before,
+        &receipts,
+        &head_after,
+        complete,
+        unix_ts,
+        &pubkey,
+        &signature,
+    ) != Some(peer.node_id.clone())
+    {
+        ctx.reputation.lock().await.record_invalid(&peer.addr);
+        return Ok(false);
+    }
+    if head_before != genesis_head() {
+        return Ok(false);
+    }
+    if !complete {
+        // Chains longer than one window are not auditable in this
+        // version: accept without caching.
+        eprintln!(
+            "[audit] {} chain longer than one window; skipping",
+            peer.node_id
+        );
+        return Ok(true);
+    }
+    if head_after != expected_head {
+        return Ok(false);
+    }
+    for receipt in &receipts {
+        let Message::Receipt {
+            task_id,
+            provider_node,
+            billed_secs,
+            charge,
+            outcome_hash,
+            unix_ts,
+            pubkey,
+            signature,
+            ..
+        } = receipt
+        else {
+            return Ok(false);
+        };
+        if verify_receipt(
+            task_id,
+            provider_node,
+            *billed_secs,
+            *charge,
+            outcome_hash,
+            *unix_ts,
+            pubkey,
+            signature,
+        )
+        .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    if !verify_window(genesis_head(), &receipts, head_after) {
+        return Ok(false);
+    }
+    ctx.audited_heads
+        .lock()
+        .await
+        .insert(peer.node_id.clone(), expected_head);
+    Ok(true)
 }
 
 pub fn bid_units(config: &Config, points: u32) -> i64 {
     crate::trust::points::units_for(points, config.network.task_timeout_secs)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-    use rand::rngs::OsRng;
-
-    fn test_key() -> SigningKey {
-        SigningKey::generate(&mut OsRng)
-    }
-
-    #[test]
-    fn timestamp_accepted_within_age_and_skew() {
-        assert!(timestamp_fresh(1000, 1000, 10, 5));
-        assert!(timestamp_fresh(990, 1000, 10, 5));
-        assert!(timestamp_fresh(1005, 1000, 10, 5));
-    }
-
-    #[test]
-    fn timestamp_rejected_when_stale_or_from_future() {
-        assert!(!timestamp_fresh(989, 1000, 10, 5));
-        assert!(!timestamp_fresh(1006, 1000, 10, 5));
-        assert!(!timestamp_fresh(0, 10_000, 10, 5));
-    }
-
-    #[test]
-    fn valid_bid_authenticates_signer_node_id() {
-        let key = test_key();
-        let pubkey = key.verifying_key().to_bytes();
-        let payload = Message::bid_signing_payload("t1", 90, 10, 12345);
-        let signature = key.sign(&payload).to_vec();
-        let claimed = verify_bid("t1", 90, 10, 12345, &pubkey, &signature);
-        assert_eq!(
-            claimed.as_deref(),
-            Some(Identity::node_id_from_pubkey(&pubkey).as_str())
-        );
-    }
-
-    #[test]
-    fn tampered_claim_breaks_bid_signature() {
-        let key = test_key();
-        let pubkey = key.verifying_key().to_bytes();
-        let payload = Message::bid_signing_payload("t1", 90, 10, 12345);
-        let signature = key.sign(&payload).to_vec();
-        assert!(verify_bid("t1", 91, 10, 12345, &pubkey, &signature).is_none());
-        assert!(verify_bid("t1", 90, 11, 12345, &pubkey, &signature).is_none());
-        assert!(verify_bid("t2", 90, 10, 12345, &pubkey, &signature).is_none());
-    }
-
-    #[test]
-    fn valid_swarm_join_authenticates_signer_node_id() {
-        let key = test_key();
-        let pubkey = key.verifying_key().to_bytes();
-        let payload = Message::swarm_signing_payload("demo", 4096, 8, 2, 12345);
-        let signature = key.sign(&payload).to_vec();
-        let claimed = verify_swarm_join("demo", 4096, 8, 2, 12345, &pubkey, &signature);
-        assert_eq!(
-            claimed.as_deref(),
-            Some(Identity::node_id_from_pubkey(&pubkey).as_str())
-        );
-        assert!(verify_swarm_join("demo", 4096, 8, 3, 12345, &pubkey, &signature).is_none());
-    }
-
-    #[test]
-    fn valid_receipt_authenticates_provider_and_covers_every_field() {
-        let key = test_key();
-        let pubkey = key.verifying_key().to_bytes();
-        let node = Identity::node_id_from_pubkey(&pubkey);
-        let payload = Message::receipt_signing_payload("t1", &node, 12, 24, &[5; 32], 12345);
-        let signature = key.sign(&payload).to_vec();
-        assert!(
-            verify_receipt("t1", &node, 12, 24, &[5; 32], 12345, &pubkey, &signature).is_some()
-        );
-        assert!(
-            verify_receipt("t1", &node, 13, 24, &[5; 32], 12345, &pubkey, &signature).is_none()
-        );
-        assert!(
-            verify_receipt("t1", &node, 12, 25, &[5; 32], 12345, &pubkey, &signature).is_none()
-        );
-        assert!(
-            verify_receipt("t1", &node, 12, 24, &[6; 32], 12345, &pubkey, &signature).is_none()
-        );
-    }
-
-    #[test]
-    fn receipt_signed_for_a_claimed_node_id_is_rejected() {
-        let key = test_key();
-        let pubkey = key.verifying_key().to_bytes();
-        let payload =
-            Message::receipt_signing_payload("t1", "someone-else", 12, 24, &[5; 32], 12345);
-        let signature = key.sign(&payload).to_vec();
-        assert!(verify_receipt(
-            "t1",
-            "someone-else",
-            12,
-            24,
-            &[5; 32],
-            12345,
-            &pubkey,
-            &signature
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn valid_gossip_authenticates_the_relayer() {
-        let key = test_key();
-        let pubkey = key.verifying_key().to_bytes();
-        let addrs = vec!["tcp:203.0.113.7:7000".to_string()];
-        let payload = Message::gossip_signing_payload(&addrs, 12345);
-        let signature = key.sign(&payload).to_vec();
-        assert!(verify_gossip(&addrs, 12345, &pubkey, &signature).is_some());
-        let other = vec!["tcp:203.0.113.8:7000".to_string()];
-        assert!(verify_gossip(&other, 12345, &pubkey, &signature).is_none());
-    }
-
-    #[test]
-    fn bid_units_follow_configured_task_timeout() {
-        let mut config = Config::default();
-        config.network.task_timeout_secs = 300;
-        assert_eq!(bid_units(&config, 2), 10);
-        config.network.task_timeout_secs = 30;
-        assert_eq!(bid_units(&config, 2), 2);
-        config.network.task_timeout_secs = 0;
-        assert_eq!(bid_units(&config, 7), 7);
-    }
 }

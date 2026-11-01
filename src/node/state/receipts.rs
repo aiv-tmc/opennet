@@ -4,22 +4,23 @@
 //! consumer answers with a countersignature (`ReceiptAck`). The journal
 //! chains receipts into a rolling hash — each entry commits to all
 //! previous ones — and the chain head travels with the node's identity
-//! announcement. A node that wipes its state to mint a fresh identity
-//! resets its chain to the genesis head, which peers price as "no
-//! history"; a node that forges history cannot produce the matching
-//! countersignatures on demand. The journal is the audit trail that
-//! turns the self-attested trust economy into a verifiable one.
+//! announcement. Peers may request a window of the journal
+//! (`ReceiptRequest`/`ReceiptResponse`) and recompute the chaining hash
+//! to verify the announcement is backed by real receipts; a mismatch
+//! costs the liar the market. The full journal is held in memory
+//! (LAN-scale evidence; tens of bytes per entry) so any window can be
+//! served without re-parsing the disk log.
 //!
 //! Storage layout in the state directory:
 //!   receipts.jsonl — one `{"receipt": <wire message>}` per line
 //!   receipts-acks.jsonl — one `{"ack": <wire message>}` per line
-//! Each line stores the message through its standard serde encoding, so
-//! the on-disk format is exactly the wire format replayed. Lines are
-//! appended and flushed per record; the files are written with
-//! owner-only permissions.
+//! Each line stores the message through its standard serde encoding — the
+//! on-disk format is the wire format replayed. Lines are appended and
+//! flushed per record; files are owner-only.
 
 use crate::message::Message;
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -29,27 +30,50 @@ pub fn genesis_head() -> [u8; 32] {
     *blake3::hash(b"opennet receipt journal v1").as_bytes()
 }
 
-/// Hash of one receipt: the canonical wire bytes, domain-tagged by the
-/// message encoding itself.
+/// Hash of one receipt: the canonical wire bytes.
 pub fn receipt_hash(receipt: &Message) -> [u8; 32] {
     *blake3::hash(&receipt.encode()).as_bytes()
 }
 
-/// The receipt journal: a replayable chain plus its on-disk append log.
+/// Chain hash over a window: start at `head_before`, fold every
+/// receipt's canonical bytes in, and require the final head to equal
+/// `head_after`. Returns `false` on any non-receipt entry or a broken
+/// link; per-entry signatures are verified separately by the caller.
+pub fn verify_window(head_before: [u8; 32], receipts: &[Message], head_after: [u8; 32]) -> bool {
+    let mut head = head_before;
+    for receipt in receipts {
+        let Message::Receipt { .. } = receipt else {
+            return false;
+        };
+        let mut material = Vec::with_capacity(64);
+        material.extend_from_slice(&head);
+        material.extend_from_slice(&receipt.encode());
+        head = *blake3::hash(&material).as_bytes();
+    }
+    head == head_after
+}
+
+/// The receipt journal: a replayable chain, its on-disk append log and
+/// the in-memory index that serves audit windows.
 pub struct ReceiptLog {
     head: [u8; 32],
     count: u64,
     receipts_file: PathBuf,
     acks_file: PathBuf,
+    /// Every receipt in chain order.
+    entries: Vec<Message>,
+    /// `heads[i]` is the chain head after `entries[i]`.
+    heads: Vec<[u8; 32]>,
+    /// Chain head *before* entry `i` -> `i`; the genesis head maps to 0.
+    index: HashMap<[u8; 32], usize>,
 }
 
 impl ReceiptLog {
-    /// Open (or create) the journal in `state_dir` and replay every
-    /// stored record to rebuild the chain head. The directory is
-    /// created when missing so the log works standalone, outside
-    /// `NodeState::load` as well. A corrupt line aborts the load: the
-    /// journal is evidence, and silently skipping evidence is worse
-    /// than refusing to start.
+    /// Open (or create) the journal in `state_dir`, replaying every
+    /// stored record to rebuild the chain, the in-memory entries and
+    /// the window index. The directory is created when missing. A
+    /// corrupt line aborts the load: the journal is evidence, and
+    /// silently skipping evidence is worse than refusing to start.
     pub fn load(state_dir: &Path) -> Result<ReceiptLog> {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("cannot create {}", state_dir.display()))?;
@@ -60,7 +84,11 @@ impl ReceiptLog {
             count: 0,
             receipts_file: receipts_file.clone(),
             acks_file: acks_file.clone(),
+            entries: Vec::new(),
+            heads: Vec::new(),
+            index: HashMap::new(),
         };
+        log.index.insert(genesis_head(), 0);
         if receipts_file.exists() {
             let text =
                 std::fs::read_to_string(&receipts_file).context("cannot read receipts.jsonl")?;
@@ -77,9 +105,6 @@ impl ReceiptLog {
                 log.chain(&receipt)?;
             }
         }
-        // The acks log is replayed for existence validation only; acks
-        // do not advance the chain (they evidence consumer assent, not
-        // a new billing fact).
         if acks_file.exists() {
             let text =
                 std::fs::read_to_string(&acks_file).context("cannot read receipts-acks.jsonl")?;
@@ -101,8 +126,7 @@ impl ReceiptLog {
         Ok(log)
     }
 
-    /// Rolling head of the receipt chain; the genesis head while the
-    /// journal is empty. Announced with the identity.
+    /// Rolling head of the receipt chain; the genesis head while empty.
     pub fn head(&self) -> [u8; 32] {
         self.head
     }
@@ -117,16 +141,37 @@ impl ReceiptLog {
         self.count == 0
     }
 
-    /// Append one provider-signed receipt: advance the chain, persist
-    /// the record, flush before returning. Duplicate task ids are
-    /// rejected — the chain must be a set, not a multiset, or the
-    /// double-billing check loses meaning.
+    /// Serve one audit window: the receipts after `head_before` (at
+    /// most `limit`), the chain head after the last returned receipt
+    /// and `complete` when the window reached the chain end. Returns
+    /// `None` when `head_before` is not a known chain position.
+    pub fn window(
+        &self,
+        head_before: [u8; 32],
+        limit: usize,
+    ) -> Option<(Vec<Message>, [u8; 32], bool)> {
+        let start = *self.index.get(&head_before)?;
+        let end = (start + limit).min(self.entries.len());
+        let receipts = self.entries[start..end].to_vec();
+        let head_after = if end == 0 {
+            head_before
+        } else {
+            self.heads[end - 1]
+        };
+        let complete = end == self.entries.len();
+        Some((receipts, head_after, complete))
+    }
+
+    /// Append one provider-signed receipt: refuse duplicates (the
+    /// chain is a set, not a multiset), advance the chain, persist and
+    /// flush.
     pub fn append(&mut self, receipt: Message) -> Result<()> {
         let Message::Receipt { ref task_id, .. } = receipt else {
             bail!("only Receipt messages enter the receipt journal");
         };
-        let exists = self.task_recorded(task_id)?;
-        if exists {
+        if self.entries.iter().any(|entry| {
+            matches!(entry, Message::Receipt { task_id: recorded, .. } if recorded == task_id)
+        }) {
             bail!("duplicate receipt for task {task_id}");
         }
         self.chain(&receipt)?;
@@ -143,55 +188,26 @@ impl ReceiptLog {
         Ok(())
     }
 
-    /// Best-effort duplicate check used at append time: scan the log
-    /// for the task id. The journal is append-only and small in
-    /// practice; a linear scan keeps the structure trivially
-    /// verifiable instead of hiding an index that could diverge from
-    /// the chain. Records are decoded through the wire format (the
-    /// same path replay uses), so the duplicate check can never drift
-    /// from what the chain actually holds.
-    fn task_recorded(&self, task_id: &str) -> Result<bool> {
-        if !self.receipts_file.exists() {
-            return Ok(false);
-        }
-        let text = std::fs::read_to_string(&self.receipts_file)?;
-        for line in text.lines().filter(|line| !line.is_empty()) {
-            let parsed: serde_json::Value = serde_json::from_str(line)?;
-            let Some(record) = parsed.get("receipt").cloned() else {
-                continue;
-            };
-            let Ok(Message::Receipt {
-                task_id: recorded, ..
-            }) = serde_json::from_value(record)
-            else {
-                continue;
-            };
-            if recorded == task_id {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Advance the in-memory chain over one receipt. The chaining hash
-    /// covers the previous head and the canonical receipt bytes, so
-    /// every entry commits to the entire history.
+    /// Advance the in-memory chain over one receipt, mirroring the
+    /// on-disk append.
     fn chain(&mut self, receipt: &Message) -> Result<()> {
         if !matches!(receipt, Message::Receipt { .. }) {
             bail!("chain accepts receipts only");
         }
+        self.index.insert(self.head, self.entries.len());
         let mut material = Vec::with_capacity(64);
         material.extend_from_slice(&self.head);
         material.extend_from_slice(&receipt.encode());
         self.head = *blake3::hash(&material).as_bytes();
+        self.entries.push(receipt.clone());
+        self.heads.push(self.head);
         self.count += 1;
         Ok(())
     }
 }
 
-/// Append one JSON line to a journal file, creating it with
-/// owner-only permissions, and flush before returning: a receipt that
-/// survives a crash must be visible on replay.
+/// Append one JSON line to a journal file, owner-only, flushed before
+/// returning: a receipt that survives a crash must be visible on replay.
 fn append_line(path: &Path, field: &str, message: &Message) -> Result<()> {
     let mut wrapper = serde_json::Map::new();
     wrapper.insert(field.to_string(), serde_json::to_value(message)?);
@@ -254,17 +270,18 @@ mod tests {
     fn chain_advances_per_receipt_and_replays_from_disk() {
         let dir = scratch_dir("rcpt-chain");
         let provider = Identity::generate();
+        let head_after_two;
         {
             let mut log = ReceiptLog::load(&dir).unwrap();
             log.append(signed_receipt("t1", &provider)).unwrap();
             log.append(signed_receipt("t2", &provider)).unwrap();
-            let head = log.head();
-            assert_ne!(head, genesis_head());
+            head_after_two = log.head();
+            assert_ne!(head_after_two, genesis_head());
             assert_eq!(log.count(), 2);
         }
-        // Replay rebuilds the identical head.
         let reloaded = ReceiptLog::load(&dir).unwrap();
         assert_eq!(reloaded.count(), 2);
+        assert_eq!(reloaded.head(), head_after_two);
     }
 
     #[test]
@@ -273,9 +290,33 @@ mod tests {
         let provider = Identity::generate();
         let mut log = ReceiptLog::load(&dir).unwrap();
         log.append(signed_receipt("t1", &provider)).unwrap();
-        // A second receipt for the same task id must be refused even
-        // when every field is identical (same-second timestamp).
         assert!(log.append(signed_receipt("t1", &provider)).is_err());
         assert_eq!(log.count(), 1);
+    }
+
+    #[test]
+    fn windows_serve_chain_slices_with_verifiable_heads() {
+        let dir = scratch_dir("rcpt-window");
+        let provider = Identity::generate();
+        let mut log = ReceiptLog::load(&dir).unwrap();
+        for n in 1..=5 {
+            log.append(signed_receipt(&format!("t{n}"), &provider))
+                .unwrap();
+        }
+        // Full window from the genesis head reaches the live head.
+        let (receipts, head_after, complete) = log.window(genesis_head(), 16).unwrap();
+        assert_eq!(receipts.len(), 5);
+        assert!(complete);
+        assert!(verify_window(genesis_head(), &receipts, head_after));
+        assert_eq!(head_after, log.head());
+        // A bounded window is internally consistent and incomplete.
+        let (receipts, head_after, complete) = log.window(genesis_head(), 2).unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert!(!complete);
+        assert!(verify_window(genesis_head(), &receipts, head_after));
+        // Chaining from the wrong anchor fails.
+        assert!(!verify_window([9; 32], &receipts, head_after));
+        // An unknown anchor serves nothing.
+        assert!(log.window([8; 32], 2).is_none());
     }
 }

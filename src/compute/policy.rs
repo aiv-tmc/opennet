@@ -43,12 +43,12 @@ pub fn stranger_factor(config: &Config, consumer_known: bool) -> i64 {
 }
 
 /// Evaluate one verified bid: capacity first, then the trust floor
-/// against the announced snapshot and the provider-side in-flight
-/// total. The signed trust claim must not exceed the consumer's last
-/// announced value, and the reservation is priced from this provider's
-/// own announced capacity points — including the GPU offer and the
-/// stranger surcharge — so consumer and provider compute the identical
-/// number.
+/// against the announced snapshot, then the receipt-chain audit for
+/// consumers claiming more trust than the genesis endowment — their
+/// announced head must verify against the receipts they can produce.
+/// The reservation is priced from this provider's own announced
+/// capacity points, the GPU offer and the stranger surcharge, so
+/// consumer and provider compute the identical number.
 pub async fn evaluate_bid(
     ctx: &Arc<Ctx>,
     from_node: &str,
@@ -76,6 +76,17 @@ pub async fn evaluate_bid(
     let effective = trust - consumed as i64 - in_flight;
     if effective < ctx.config.trust.min_trust {
         return Decision::Reject("insufficient trust");
+    }
+    // Receipt-chain audit: earned trust must be backed by a chain whose
+    // recomputed head matches the announcement. An unreachable peer
+    // does not block the market (the surcharge already prices the
+    // risk); a peer whose chain mismatches is refused outright.
+    if trust > ctx.config.trust.genesis_trust && peer.receipt_head != genesis_head() {
+        match crate::trust::handlers::audit_chain(ctx, &peer, peer.receipt_head).await {
+            Ok(true) => {}
+            Ok(false) => return Decision::Reject("receipt chain mismatch"),
+            Err(err) => eprintln!("[audit] {} skipped: {err:#}", peer.node_id),
+        }
     }
     let points = ctx.state.lock().await.points;
     let factor = stranger_factor(&ctx.config, peer.receipt_head != genesis_head());
@@ -201,13 +212,12 @@ mod tests {
     #[tokio::test]
     async fn known_consumer_is_accepted_with_base_units() {
         let (ctx, _rx) = make_ctx("pol-ok").await;
+        // Trust at the genesis endowment: no audit trigger, base price.
         announce_consumer(&ctx, "node-x", 100, [9; 32]).await;
         let decision = evaluate_bid(&ctx, "node-x", 100, 0, u64::MAX, 0).await;
         let Decision::Accept { units } = decision else {
             panic!("expected acceptance");
         };
-        // 24 default points * 5 started minutes; the non-genesis head
-        // means no stranger surcharge.
         assert_eq!(units, 120);
     }
 
@@ -219,8 +229,18 @@ mod tests {
         let Decision::Accept { units } = decision else {
             panic!("expected acceptance");
         };
-        // 120 base units * the default factor of 2.
         assert_eq!(units, 240);
+    }
+
+    #[tokio::test]
+    async fn earned_trust_from_an_unreachable_peer_does_not_block_the_market() {
+        let (ctx, _rx) = make_ctx("pol-audit-skip").await;
+        // Claims trust above genesis with a non-genesis head but cannot
+        // answer an audit: the bid still goes through (best-effort
+        // audit), priced by the announced head.
+        announce_consumer(&ctx, "node-x", 500, [9; 32]).await;
+        let decision = evaluate_bid(&ctx, "node-x", 500, 0, u64::MAX, 0).await;
+        assert!(matches!(decision, Decision::Accept { .. }));
     }
 
     #[test]

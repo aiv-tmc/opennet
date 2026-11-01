@@ -1,17 +1,14 @@
-//! Graceful-shutdown drain of the compute scheduler, kept in its own
-//! submodule so the scheduling core stays within a readable size. The
-//! drain is entered once, when the shared shutdown flag fires: new bids
-//! are refused, every accepted-but-unassigned bid and every parked
-//! launch is rejected so consumers release their reserved trust
-//! promptly, and the tasks already running finish within a bounded
-//! window.
+//! Graceful-shutdown drain of the compute scheduler: new bids are
+//! refused with signed rejections, accepted-but-unassigned bids and
+//! parked launches are rejected so consumers release their reserved
+//! trust promptly, and the tasks already running finish within a
+//! bounded window.
 
-use super::Scheduler;
+use super::{signed_reject, Scheduler};
 use crate::compute::provider::Cmd;
 use crate::daemon::{send_msg, Ctx};
-use crate::message::Message;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Grace period granted to running tasks during a graceful shutdown;
@@ -29,19 +26,24 @@ impl Scheduler {
         launch_tx: &mpsc::Sender<crate::compute::Launch>,
     ) {
         self.shutting_down = true;
-        // Reject every accepted bid so consumers learn the outcome now
-        // instead of after their assignment timeout.
+        // Refuse every bid already sitting in the channel so the
+        // consumers release their reservations now instead of after
+        // their assignment timeout.
+        while let Ok(cmd) = rx.try_recv() {
+            if let Cmd::Bid {
+                task_id, from_addr, ..
+            } = cmd
+            {
+                let reject = signed_reject(ctx, &task_id, "daemon shutting down");
+                let _ = send_msg(ctx, &from_addr, &reject).await;
+            }
+        }
+        // Reject every accepted bid so its consumer learns the outcome
+        // immediately.
         let accepted = std::mem::take(&mut self.accepted);
         for (task_id, bid) in accepted {
-            let _ = send_msg(
-                ctx,
-                &bid.from_addr,
-                &Message::TaskReject {
-                    task_id,
-                    reason: "daemon shutting down".to_string(),
-                },
-            )
-            .await;
+            let reject = signed_reject(ctx, &task_id, "daemon shutting down");
+            let _ = send_msg(ctx, &bid.from_addr, &reject).await;
         }
         // Every expiry is a positive unix timestamp, so purging at zero
         // clears the whole queue; the queue mirrors the accepted map,
@@ -52,22 +54,16 @@ impl Scheduler {
         let pending = std::mem::take(&mut self.pending);
         for parked in pending {
             self.return_units(&parked.from_node, parked.units);
-            let _ = send_msg(
-                ctx,
-                &parked.launch.return_addr,
-                &Message::TaskReject {
-                    task_id: parked.launch.task_id,
-                    reason: "daemon shutting down".to_string(),
-                },
-            )
-            .await;
+            let reject = signed_reject(ctx, &parked.launch.task_id, "daemon shutting down");
+            let _ = send_msg(ctx, &parked.launch.return_addr, &reject).await;
         }
         eprintln!("[provider] draining {} running task(s)", self.running.len());
-        let deadline = Instant::now() + DRAIN_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
         while !self.running.is_empty() {
             // `Instant` has no saturating subtraction: a missing
             // duration means the deadline passed and the drain gives up.
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
                 eprintln!(
                     "[provider] drain deadline reached with {} task(s) still running",
                     self.running.len()
@@ -79,33 +75,21 @@ impl Scheduler {
                     Ok(Some(Cmd::Freed { task_id })) => {
                         self.on_freed(ctx, task_id, launch_tx).await
                     }
-                    Ok(Some(late)) => self.refuse_late(ctx, late).await,
+                    // Late bids during the drain are refused like the
+                    // pre-drain ones; assignments have nothing to attach
+                    // to and are ignored.
+                    Ok(Some(Cmd::Bid {
+                        task_id, from_addr, ..
+                    })) => {
+                        let reject = signed_reject(ctx, &task_id, "daemon shutting down");
+                        let _ = send_msg(ctx, &from_addr, &reject).await;
+                    }
+                    Ok(_) => break,
                     // Deadline elapsed or every sender gone: stop waiting.
-                    _ => break,
+                    Err(_) => break,
                 },
             }
         }
         eprintln!("[provider] drain complete");
-    }
-
-    /// Answer one command that arrived after the drain began: bids are
-    /// rejected so the consumer releases its reservation immediately
-    /// instead of waiting for a timeout; anything else is ignored
-    /// because the accepted map and the pending heap are already empty.
-    async fn refuse_late(&mut self, ctx: &Arc<Ctx>, cmd: Cmd) {
-        if let Cmd::Bid {
-            task_id, from_addr, ..
-        } = cmd
-        {
-            let _ = send_msg(
-                ctx,
-                &from_addr,
-                &Message::TaskReject {
-                    task_id,
-                    reason: "daemon shutting down".to_string(),
-                },
-            )
-            .await;
-        }
     }
 }

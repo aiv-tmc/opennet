@@ -1,21 +1,21 @@
 //! Wire protocol: one `Message` enum postcard-encoded onto the
-//! transport. Signed variants carry their ed25519 public key and
-//! signature inline; verification recomputes the domain-tagged signing
-//! payload (see `signing.rs`) from the decoded fields, so a signature
-//! never covers bytes the receiver cannot reconstruct.
+//! transport. Signed variants carry the ed25519 public key and
+//! signature inline; verification always recomputes the domain-tagged
+//! signing payload (see `signing.rs`) from the decoded fields, so a
+//! signature never covers bytes the receiver cannot reconstruct.
 //!
-//! Protocol version 7 adds WAN seed gossip: beyond the LAN multicast
-//! group, every node can carry a static seed list and relay capped
-//! routing-table snapshots to its peers, so meshes discover each other
-//! across NAT segments through the seeds they share. Gossiped addresses
-//! are unverified seeds — identity always comes from signed
-//! announcements, so gossip can widen the mesh but never forge it.
+//! Protocol version 9 hardens the compute market by signing every
+//! bid-decision and result frame: TaskAccept, TaskReject and TaskResult
+//! all carry the provider's public key, a timestamp and a signature
+//! over the task id (and the outcome hash for results), so a frame
+//! injected from a connection sharing the same listener port cannot
+//! complete a consumer's waiter.
 
 use serde::{Deserialize, Serialize};
 
 /// Bump on every wire-incompatible change; the transport refuses to
 /// establish sessions with a different version.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// One frame on the wire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -65,14 +65,23 @@ pub enum Message {
     },
     TaskAccept {
         task_id: String,
+        unix_ts: u64,
+        pubkey: [u8; 32],
+        signature: Vec<u8>,
     },
     TaskReject {
         task_id: String,
         reason: String,
+        unix_ts: u64,
+        pubkey: [u8; 32],
+        signature: Vec<u8>,
     },
     TaskResult {
         task_id: String,
         outcome: crate::compute::TaskOutcome,
+        unix_ts: u64,
+        pubkey: [u8; 32],
+        signature: Vec<u8>,
     },
     Receipt {
         task_id: String,
@@ -87,6 +96,31 @@ pub enum Message {
     ReceiptAck {
         task_id: String,
         receipt_hash: [u8; 32],
+        unix_ts: u64,
+        pubkey: [u8; 32],
+        signature: Vec<u8>,
+    },
+    /// Signed request for one window of the peer's receipt journal,
+    /// starting after `head_before` (use the genesis head for a
+    /// full-chain audit). The response echoes `request_id`.
+    ReceiptRequest {
+        request_id: [u8; 32],
+        head_before: [u8; 32],
+        limit: u32,
+        unix_ts: u64,
+        pubkey: [u8; 32],
+        signature: Vec<u8>,
+    },
+    /// Signed window of the journal: the receipts after `head_before`,
+    /// the chain head after the last returned receipt, and `complete`
+    /// when the window reached the chain end. The requestor recomputes
+    /// the chaining hash over the window and compares `head_after`.
+    ReceiptResponse {
+        request_id: [u8; 32],
+        head_before: [u8; 32],
+        receipts: Vec<Message>,
+        head_after: [u8; 32],
+        complete: bool,
         unix_ts: u64,
         pubkey: [u8; 32],
         signature: Vec<u8>,
@@ -139,11 +173,6 @@ pub enum Message {
         plan_id: String,
         reason: String,
     },
-    /// Signed WAN gossip: a capped snapshot of the sender's routing
-    /// table (dial addresses only, no identity claims). Receivers seed
-    /// every address as unverified; signed announcements still provide
-    /// every verified field afterwards, so gossip widens the mesh
-    /// without weakening its verification.
     PeerGossip {
         addrs: Vec<String>,
         unix_ts: u64,

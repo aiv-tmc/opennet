@@ -248,8 +248,18 @@ fn bench_transport(c: &mut Criterion) {
         ))
         .unwrap();
     let dest = b.local_id();
+    // The transport roundtrip moves exactly the frames the wire carries
+    // today, so the accept decision is signed like a real decision; the
+    // signing happens once, outside the timed loop.
+    let signer = Identity::generate();
+    let unix_ts = opennet::trust::now_unix();
     let frame: bytes::Bytes = Message::TaskAccept {
         task_id: "bench".into(),
+        unix_ts,
+        pubkey: signer.pubkey(),
+        signature: signer
+            .sign(&Message::accept_signing_payload("bench", unix_ts))
+            .to_vec(),
     }
     .encode()
     .into();

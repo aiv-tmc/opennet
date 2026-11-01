@@ -16,7 +16,7 @@ mod receipts;
 #[cfg(test)]
 mod tests;
 
-pub use receipts::{genesis_head, receipt_hash, ReceiptLog};
+pub use receipts::{genesis_head, receipt_hash, verify_window, ReceiptLog};
 
 /// Operating mode of the node.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,16 +1,17 @@
-//! Sandboxed task execution: run one command per launch with the
-//! configured isolation profile, capture its output under hard caps,
-//! bill the actual runtime, sign the billing receipt, record it in the
-//! local journal and report both the receipt and the outcome to the
-//! consumer.
+//! Sandboxed task execution: one launch becomes one sandboxed child
+//! process whose output is captured under hard caps, whose runtime is
+//! billed into `[1, timeout]`, and whose settlement — counters, trust
+//! credit, signed billing receipt, journal entry and signed result —
+//! completes before the caller continues. `run` is the scheduler-facing
+//! loop around `execute`.
 //!
 //! Billing clamps the measured runtime into `[1, timeout]` so the
 //! charge always reflects a task that really ran and never exceeds the
 //! reservation window. The credited units are priced from the same
 //! announced capacity points the consumer reserved against — CPU/RAM
-//! points plus the GPU offer and the stranger surcharge — so settlement
-//! moves both ledgers by the same amount, and the receipt binds the
-//! charge to the exact output hash the consumer verifies.
+//! points plus the GPU offer and the consumer's receipt history — so
+//! settlement moves both ledgers by the same amount, and the receipt
+//! binds the charge to the exact output hash the consumer verifies.
 
 use crate::compute::policy::stranger_factor;
 use crate::compute::provider::Cmd;
@@ -28,56 +29,47 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-/// Hard cap on one captured output stream.
+/// Hard cap on one captured output stream: anything past the cap is
+/// drained and discarded so the child never blocks on a full pipe.
 const OUTPUT_CAP: usize = 64 * 1024;
 
-/// Run the executor loop until the launch channel closes.
-pub async fn run(ctx: Arc<Ctx>, mut launches: mpsc::Receiver<Launch>) {
-    while let Some(launch) = launches.recv().await {
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
+/// Execute launches one at a time and report each finished slot back
+/// to the scheduler; sequential execution keeps memory and GPU pressure
+/// at exactly one task and preserves the billing order.
+pub async fn run(ctx: Arc<Ctx>, mut rx: mpsc::Receiver<Launch>) {
+    tokio::spawn(async move {
+        while let Some(launch) = rx.recv().await {
+            let task_id = launch.task_id.clone();
             execute(&ctx, launch).await;
-        });
-    }
-}
-
-/// Execute one launch end to end: spawn under the sandbox profile with
-/// the task's resource binding, wait with the wall-clock limit, kill on
-/// timeout, capture capped output, settle the provider side (counters,
-/// trust credit, signed receipt into the local journal) and report both
-/// the receipt and the outcome to the consumer. The slot accounting is
-/// released even on internal errors, so a failing task path can never
-/// leak a concurrency slot.
-pub async fn execute(ctx: &Arc<Ctx>, launch: Launch) {
-    let task_id = launch.task_id.clone();
-    let started = Instant::now();
-    let outcome = run_command(ctx, &launch).await.unwrap_or(TaskOutcome {
-        exit_code: -1,
-        stdout: String::new(),
-        stderr: "internal executor error".to_string(),
-        billed_secs: 0,
+            let _ = ctx.compute.send(Cmd::Freed { task_id }).await;
+        }
     });
-    // Billing honesty: the billed seconds are the measured runtime
-    // clamped into [1, timeout]; the consumer applies its own wall-time
-    // cap on top before settling.
-    let billed_secs = started.elapsed().as_secs().clamp(1, launch.timeout_secs);
-    let outcome = TaskOutcome {
-        billed_secs,
-        ..outcome
-    };
-    finish(ctx, &launch, outcome).await;
-    let _ = ctx.compute.send(Cmd::Freed { task_id }).await;
 }
 
-/// Provider-side settlement for one finished task: update counters,
-/// credit the earned units priced from the announced capacity points
-/// and the consumer's receipt history, record the signed receipt in the
-/// local journal (the consumer's countersignature arrives separately as
-/// a ReceiptAck), persist, and deliver the receipt plus the outcome to
-/// the consumer. The receipt travels first: the consumer's dispatcher
-/// must have it stashed before the result completes the request's
-/// waiter.
-async fn finish(ctx: &Arc<Ctx>, launch: &Launch, outcome: TaskOutcome) {
+/// Run one launch end to end: spawn the command under the sandbox
+/// profile, capture both streams under the output cap, enforce the
+/// timeout, bill the observed wall time clamped into `[1, timeout]`,
+/// then settle — task counters, trust credit priced from the announced
+/// points, the signed billing receipt appended to the local journal
+/// and sent one frame ahead of the signed task result on the same
+/// ordered connection.
+pub async fn execute(ctx: &Arc<Ctx>, launch: Launch) -> TaskOutcome {
+    let started = Instant::now();
+    let outcome = match run_command(ctx, &launch).await {
+        Ok(mut outcome) => {
+            outcome.billed_secs = started
+                .elapsed()
+                .as_secs()
+                .clamp(1, launch.timeout_secs.max(1));
+            outcome
+        }
+        Err(()) => TaskOutcome {
+            exit_code: -1,
+            stdout: String::new(),
+            stderr: "task failed to start".to_string(),
+            billed_secs: 1,
+        },
+    };
     let unix_ts = now_unix();
     let mut receipt = Message::Receipt {
         task_id: launch.task_id.clone(),
@@ -108,9 +100,6 @@ async fn finish(ctx: &Arc<Ctx>, launch: &Launch, outcome: TaskOutcome) {
             .is_some_and(|peer| peer.receipt_head != genesis_head());
         let charge = units_for(points, outcome.billed_secs) * stranger_factor(&ctx.config, known);
         state.trust = state.trust.saturating_add(charge);
-        // The provider's own journal records the issued receipt so both
-        // sides of the settlement hold the same evidence. A duplicate
-        // (retried send of the same task id) is ignored.
         if let Message::Receipt {
             charge: receipt_charge,
             signature,
@@ -130,15 +119,33 @@ async fn finish(ctx: &Arc<Ctx>, launch: &Launch, outcome: TaskOutcome) {
                 ))
                 .to_vec();
         }
+        // The provider's own journal records the issued receipt so both
+        // sides of the settlement hold the same evidence. A duplicate
+        // (retried send of the same task id) is ignored.
         let _ = state.receipts.append(receipt.clone());
         let _ = state.save();
     }
     let _ = send_msg(ctx, &launch.return_addr, &receipt).await;
+    // The result frame is signed by the provider over the outcome hash,
+    // so the consumer binds the delivered output to this node id before
+    // accepting it into its own settlement.
+    let unix_ts = now_unix();
     let result = Message::TaskResult {
+        signature: ctx
+            .identity
+            .sign(&Message::result_signing_payload(
+                &launch.task_id,
+                &outcome.hash(),
+                unix_ts,
+            ))
+            .to_vec(),
         task_id: launch.task_id.clone(),
-        outcome,
+        outcome: outcome.clone(),
+        unix_ts,
+        pubkey: ctx.identity.pubkey(),
     };
     let _ = send_msg(ctx, &launch.return_addr, &result).await;
+    outcome
 }
 
 /// Spawn the command with the sandbox profile and the launch's resource

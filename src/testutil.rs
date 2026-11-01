@@ -51,9 +51,6 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
 }
 
 /// Whether the gated sandbox-isolation test was requested for this run.
-/// When set, test contexts keep the real sandbox defaults and the
-/// isolation assertions execute; otherwise every unit test runs with
-/// the sandbox disabled for determinism.
 pub fn sandbox_test_requested() -> bool {
     std::env::var_os("OPENNET_SANDBOX_TEST").is_some()
 }
@@ -68,11 +65,6 @@ pub async fn make_ctx(tag: &str) -> (Arc<Ctx>, mpsc::Receiver<Cmd>) {
     config.paths.state_dir = dir.clone();
     config.paths.socket_path = dir.join("control.sock");
     if !sandbox_test_requested() {
-        // Unit tests must be deterministic on any host: real namespace
-        // and cgroup isolation depends on privileges the test machine
-        // may or may not grant, and on outer runtimes that may reap
-        // nested-namespace children. The sandbox is verified explicitly
-        // by the gated isolation test instead.
         config.sandbox.namespaces = false;
         config.sandbox.cgroup = false;
     }
@@ -102,6 +94,8 @@ pub async fn make_ctx(tag: &str) -> (Arc<Ctx>, mpsc::Receiver<Cmd>) {
         compute: compute_tx,
         result_waiters: Arc::new(Mutex::new(waiters)),
         pending_receipts: Arc::new(Mutex::new(HashMap::<String, Message>::new())),
+        receipt_windows: Arc::new(Mutex::new(HashMap::new())),
+        audited_heads: Arc::new(Mutex::new(HashMap::new())),
         swarm: Arc::new(Mutex::new(Consent::load(&dir, &config.swarm))),
         swarm_plans: Arc::new(Mutex::new(HashMap::<String, PlanState>::new())),
         swarm_procs: Arc::new(Mutex::new(HashMap::<String, ShardProc>::new())),

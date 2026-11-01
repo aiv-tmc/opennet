@@ -70,6 +70,21 @@ impl Message {
         .expect("signing payload serialization failed")
     }
 
+    pub fn accept_signing_payload(task_id: &str, unix_ts: u64) -> Vec<u8> {
+        postcard::to_allocvec(&("accept", PROTOCOL_VERSION, task_id, unix_ts))
+            .expect("signing payload serialization failed")
+    }
+
+    pub fn reject_signing_payload(task_id: &str, reason: &str, unix_ts: u64) -> Vec<u8> {
+        postcard::to_allocvec(&("reject", PROTOCOL_VERSION, task_id, reason, unix_ts))
+            .expect("signing payload serialization failed")
+    }
+
+    pub fn result_signing_payload(task_id: &str, outcome_hash: &[u8; 32], unix_ts: u64) -> Vec<u8> {
+        postcard::to_allocvec(&("result", PROTOCOL_VERSION, task_id, outcome_hash, unix_ts))
+            .expect("signing payload serialization failed")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn receipt_signing_payload(
         task_id: &str,
@@ -102,6 +117,44 @@ impl Message {
             PROTOCOL_VERSION,
             task_id,
             receipt_hash,
+            unix_ts,
+        ))
+        .expect("signing payload serialization failed")
+    }
+
+    pub fn receipt_request_signing_payload(
+        request_id: &[u8; 32],
+        head_before: &[u8; 32],
+        limit: u32,
+        unix_ts: u64,
+    ) -> Vec<u8> {
+        postcard::to_allocvec(&(
+            "receipt_request",
+            PROTOCOL_VERSION,
+            request_id,
+            head_before,
+            limit,
+            unix_ts,
+        ))
+        .expect("signing payload serialization failed")
+    }
+
+    pub fn receipt_response_signing_payload(
+        request_id: &[u8; 32],
+        head_before: &[u8; 32],
+        receipts: &[Message],
+        head_after: &[u8; 32],
+        complete: bool,
+        unix_ts: u64,
+    ) -> Vec<u8> {
+        postcard::to_allocvec(&(
+            "receipt_response",
+            PROTOCOL_VERSION,
+            request_id,
+            head_before,
+            receipts,
+            head_after,
+            complete,
             unix_ts,
         ))
         .expect("signing payload serialization failed")
@@ -193,9 +246,6 @@ impl Message {
         .expect("signing payload serialization failed")
     }
 
-    /// Bytes covered by a `PeerGossip` signature: domain tag, the
-    /// address snapshot and the timestamp — the sender commits to
-    /// relaying exactly this (capped) table.
     pub fn gossip_signing_payload(addrs: &[String], unix_ts: u64) -> Vec<u8> {
         postcard::to_allocvec(&("peer_gossip", PROTOCOL_VERSION, addrs, unix_ts))
             .expect("signing payload serialization failed")

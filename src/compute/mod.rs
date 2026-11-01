@@ -11,8 +11,9 @@ pub mod policy;
 pub mod provider;
 pub mod queue;
 
-/// Result of one executed task, delivered unsigned over the
-/// authenticated connection.
+/// Result of one executed task. The provider signs the TaskResult
+/// frame over this outcome's hash, so the delivered exit code and both
+/// captured output streams are bound to the provider's identity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskOutcome {
     pub exit_code: i32,
@@ -30,7 +31,7 @@ impl TaskOutcome {
     /// stderr plus the exit code. Two providers returning the same
     /// output produce the same hash, which is what the consumer's
     /// redundant-execution verification compares; the billing receipt
-    /// binds the charge to this same hash.
+    /// and the TaskResult signature both bind to this same hash.
     pub fn hash(&self) -> [u8; 32] {
         let mut material = Vec::with_capacity(self.stdout.len() + self.stderr.len() + 4);
         material.extend_from_slice(&self.exit_code.to_le_bytes());
@@ -69,11 +70,24 @@ pub enum ComputeEvent {
     Outcome(TaskOutcome),
 }
 
-/// Complete one waiter entry if the task id is known; the event is
-/// dropped when nobody waits for it (e.g. a late duplicate result).
-pub async fn deliver_event(ctx: &Arc<crate::daemon::Ctx>, task_id: &str, event: ComputeEvent) {
-    if let Some(waiter) = ctx.result_waiters.lock().await.remove(task_id) {
-        let _ = waiter.1.send(event);
+/// Complete one consumer waiter when the signed frame's signer is the
+/// provider node id the request was booked with. The waiter stays
+/// registered when the signer does not match, so an injected frame can
+/// never satisfy an in-flight request and the request lives until its
+/// own timeout.
+pub async fn complete_waiter(
+    ctx: &Arc<crate::daemon::Ctx>,
+    signer: &str,
+    task_id: &str,
+    event: ComputeEvent,
+) {
+    let mut waiters = ctx.result_waiters.lock().await;
+    let matches = waiters
+        .get(task_id)
+        .is_some_and(|(expected, _)| expected == signer);
+    if matches {
+        let (_, sender) = waiters.remove(task_id).expect("waiter checked above");
+        let _ = sender.send(event);
     }
 }
 
@@ -108,6 +122,9 @@ mod tests {
         let message = Message::TaskResult {
             task_id: "t".into(),
             outcome: outcome.clone(),
+            unix_ts: 1_700_000_000,
+            pubkey: [1; 32],
+            signature: vec![2; 64],
         };
         let Some(Message::TaskResult {
             outcome: decoded, ..
