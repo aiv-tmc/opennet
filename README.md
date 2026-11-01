@@ -8,8 +8,12 @@ more useful a machine is to the network, the more capacity it can pull
 back. Since 0.6.0 the pool includes **GPU accelerators**; since 0.7.0
 the economy rests on **countersigned billing receipts**, tasks can be
 **verified by redundant execution**, and meshes extend beyond one LAN
-through **WAN seed gossip**. Swarm mode additionally splits one shared
-program (e.g. a sharded LLM) across consenting nodes with a hot spare.
+through **WAN seed gossip**. Since 0.8.0 every market decision
+(accept/reject/result) is **signed**, trust claims are **evidence-gated
+at bid time** through the receipt-chain audit, and the daemon compiles
+and runs on **Windows and macOS** with a degraded (no-op) sandbox.
+Swarm mode additionally splits one shared program (e.g. a sharded
+LLM) across consenting nodes with a hot spare.
 
 ## How it works
 
@@ -29,14 +33,22 @@ program (e.g. a sharded LLM) across consenting nodes with a hot spare.
   and by the reservation. Consumer and provider compute identical
   numbers, and the provider signs a **receipt** committing to the charge
   and the output hash; the consumer countersigns it (`ReceiptAck`) and
-  both journals chain the receipts into an auditable log.
+  both journals chain the receipts into an auditable log. Journal
+  entries are signature-verified on append and on every replay; acks bind
+  to the receipts they countersign.
 * A node that wants work done sends a **bid** with a signed trust
   snapshot. Providers serve the highest offer first and accept only
-  while `trust − consumed − in_flight ≥ min_trust`. Receipt-less
+  while `trust − consumed − in_flight ≥ min_trust`. Bid accept, reject
+  and task results are signed by the provider: a consumer only acts on
+  decisions that verify against the provider's node id. Receipt-less
   consumers (a wiped identity announces the genesis head) pay the
   configured stranger surcharge — Sybil resistance by pricing.
+* Trust claimed above the genesis endowment must prove itself: at bid
+  time the provider requests a signed window of the consumer's receipt
+  journal and recomputes the chain head. A mismatch — or a peer that
+  cannot answer — refuses the bid; unverifiable trust never trades.
 * Task assignments are signed by the same key that made the bid and
-  carry a signed resource request (`--gpus N`, `--ram-bb M`); the
+  carry a signed resource request (`--gpus N`, `--ram-mb M`); the
   provider re-checks the request against its advertised capacity before
   anything starts. With `--verify K` the identical task runs on K peers
   and the majority output hash wins.
@@ -101,8 +113,8 @@ Manifests live in the artifacts directory as `{program}.manifest.json`:
 
 The coordinator splits the layer space proportionally to offered RAM
 (128-bit integer math, last slot takes the remainder), keeps the **last
-slot as a hot spare** (a failed shard is relaunched on the spare with
-the identical signed launch), and relays `[u32 len][u8 tag][payload]`
+slot as a hot spare** (a failed shard is relaunched on the spare with the
+identical signed launch), and relays `[u32 len][u8 tag][payload]`
 frames (tags: 0 input, 1 forward, 2 output, 3 ready, 4 done) capped at
 1 MiB. `scripts/runners/pipeline-echo.sh` is a complete reference
 runner; (Inference)[https://github.com/aiv-tmc/opennet/wiki/Inference] describes the llama.cpp integration recipe.
@@ -126,12 +138,16 @@ Tasks run sandboxed (namespaces + cgroup v2), swarm runners with the
 same profile minus the network namespace. `opennetctl status` always
 reports the effective capability (`active` / `degraded` / `disabled`).
 Tuning in `[sandbox]`; `memory_mb = 0` and `cpu_percent = 0` inherit
-`[limits]`.
+`[limits]`. On Windows/macOS the sandbox degrades to the no-op profile
+(working directory and environment isolation only) and the control
+endpoint is a loopback TCP listener whose address is recorded where the
+socket path would be — set `OPENNET_SOCKET` for `opennetctl` to find it.
 
 ## Control interface
 
-Socket `/run/opennet/control.sock`; connections from root or the
-daemon's own uid only (`SO_PEERCRED`).
+Socket `/run/opennet/control.sock` on Unix (connections from root or the
+daemon's own uid only, `SO_PEERCRED`); a loopback TCP endpoint recorded
+in the same path on other platforms.
 
 | Command | Action |
 |---|---|
@@ -148,7 +164,8 @@ The daemon reads `--config` / `$OPENNET_CONFIG` / `/etc/opennet/config.toml`
 (a missing file materializes the defaults). Startup validation aborts
 boot naming the offending key. State in `state_dir`: `node.key`,
 `state.json`, `receipts.jsonl` + `receipts-acks.jsonl` (append-only,
-chained), `reputation.json`, `swarm.toml`. Reservations are in-memory.
+chained, signature-verified), `reputation.json`, `swarm.toml`.
+Reservations are in-memory.
 
 ```toml
 mode = "peer"
@@ -163,8 +180,11 @@ mode = "peer"
 
 ## Security notes
 
-* Wire protocol v7; version negotiation precedes signature checks, and
+* Wire protocol v9; version negotiation precedes signature checks, and
   every signed frame covers the version.
+* Bid decisions and results are signed by the provider; consumer waiters
+  bind by provider node id, so an injected decision from any other key
+  — even on the same listener port — cannot satisfy or poison a request.
 * Every failed verification is penalized against the connection
   address, never a claimed node id.
 * Greetings bind the advertised address to the real socket IP (wildcard
@@ -174,7 +194,12 @@ mode = "peer"
   assignments to accepted bids, re-check signed resource requests, and
   bill capped by observed wall time — with a signed receipt the consumer
   countersigns.
-* Control socket: root or daemon uid only.
+* Trust above genesis is evidence-gated: the receipt-chain audit
+  refuses mismatched or unreachable claims at bid time.
+* Receipt journals verify every entry's signature on append and on
+  replay; acks bind to issued receipts by task id and hash.
+* Control socket: root or daemon uid only (unix); loopback-only
+  elsewhere.
 * The trust economy is self-attested at the announcement level but
   receipt-chained: wiping state resets the journal to the genesis head
   and lands the new identity on stranger pricing, and receipt
@@ -193,7 +218,9 @@ cargo bench --bench bench -- --save-baseline main
 5. GPU market + wire v4 — **done** (0.6.0).
 6. Receipts + redundant verification + Sybil pricing + WAN gossip +
    GPU shards + spare shards + bounded queues (wire v5–v7) — **done** (0.7.0).
-7. Full gossip audit of receipt chains, seccomp/user-namespace sandbox,
-   `tracing` + metrics, committed bench baseline — planned (0.8.0).
-8. Stateful shard checkpointing (spare relaunch is lossless only for
+7. Receipt-chain audit enforcement, signed market decisions, journal
+   hardening, Windows/macOS base (wire v8–v9) — **done** (0.8.0).
+8. Full gossip audit window-walk, seccomp/user-namespace sandbox,
+   `tracing` + metrics, committed bench baseline — planned (0.9.0).
+9. Stateful shard checkpointing (spare relaunch is lossless only for
    stateless runners today), multi-program consent — planned.

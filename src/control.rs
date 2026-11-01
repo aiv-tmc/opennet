@@ -1,121 +1,141 @@
-//! Local control interface: a unix domain socket where `opennetctl`
-//! sends one command line per connection and reads the daemon's answer.
-//!
-//! Every connection gets its own task, so a slow or stuck client never
-//! blocks the others. The parser takes the subcommand token and hands
-//! the remainder of the line to the handler, so multi-word arguments
-//! (like the command of `compute`) survive intact; `compute` recognizes
-//! leading `--gpus N`, `--ram-mb M` and `--verify N` options before the
-//! command text. All response rendering lives in `render.rs` so this
-//! file stays focused on I/O.
-//!
-//! Peer credentials: every connection must come from the root user or
-//! the daemon's own user id. The socket directory is root-only by
-//! default, but a deployment that loosens the directory permissions
-//! must not silently widen the command surface — `SO_PEERCRED` closes
-//! that hole at the socket level.
+//! Local control interface: `opennetctl` talks to the daemon over one
+//! short-lived connection per command, request in, rendered response
+//! out. On Unix the endpoint is a filesystem socket guarded by peer
+//! credentials (root or the daemon's own uid); elsewhere the endpoint
+//! is a loopback TCP listener and the socket path names a small
+//! discovery file holding the `host:port` line the client reads back,
+//! which confines the control surface to local users without peer
+//! credentials.
 
 use crate::compute;
 use crate::daemon::Ctx;
 use crate::node::state::Mode;
+use crate::swarm;
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::task::JoinHandle;
+#[cfg(not(unix))]
+use tokio::net::{TcpListener, TcpStream};
 
-mod render;
-
-/// Spawn the control socket server in the background; the socket file
-/// is replaced on every start so a crashed daemon cannot leave a stale
-/// one behind.
-pub fn spawn(ctx: Arc<Ctx>) -> JoinHandle<()> {
+/// Spawn the control interface task.
+pub fn spawn(ctx: Arc<Ctx>) {
     tokio::spawn(async move {
         if let Err(err) = run(ctx).await {
-            eprintln!("[control] task terminated: {err:#}");
+            eprintln!("[control] fatal: {err:#}");
         }
-    })
+    });
 }
 
-/// Bind the control socket and serve connections until the daemon exits.
+/// Accept control connections until the process ends.
 async fn run(ctx: Arc<Ctx>) -> Result<()> {
     let path = &ctx.config.paths.socket_path;
     if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("cannot remove stale socket {}", path.display()))?;
+        std::fs::remove_file(path).context("cannot remove stale socket")?;
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create socket dir {}", parent.display()))?;
+        std::fs::create_dir_all(parent)?;
     }
-    let listener = UnixListener::bind(path)
-        .with_context(|| format!("cannot bind control socket {}", path.display()))?;
-    eprintln!("[opennetd] control socket listening on {}", path.display());
-    loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let ctx = ctx.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = serve_conn(&ctx, stream).await {
-                        eprintln!("[control] connection error: {err:#}");
-                    }
-                });
+    #[cfg(unix)]
+    {
+        let listener = UnixListener::bind(path).context("cannot bind control socket")?;
+        eprintln!("[opennetd] control socket {}", path.display());
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        let _ = serve_conn(&ctx, stream).await;
+                    });
+                }
+                Err(err) => eprintln!("[opennetd] control accept error: {err}"),
             }
-            Err(err) => eprintln!("[control] accept failed: {err:#}"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No peer credentials exist on this platform, so the listener
+        // is confined to loopback and the socket path becomes a
+        // discovery file recording the address the client dials.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("cannot bind control listener")?;
+        let addr = listener.local_addr().context("control listener addr")?;
+        std::fs::write(path, format!("{addr}\n")).context("cannot record control address")?;
+        eprintln!(
+            "[opennetd] control listener on {addr} (recorded in {})",
+            path.display()
+        );
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        let _ = serve_conn(&ctx, stream).await;
+                    });
+                }
+                Err(err) => eprintln!("[opennetd] control accept error: {err}"),
+            }
         }
     }
 }
 
-/// Refuse control connections from any uid other than root and the
-/// daemon's own effective user; the filesystem permissions on the
-/// socket directory are the first line of defense, this is the second.
+/// Peer credentials on Unix: root or the daemon's own uid may command.
 #[cfg(unix)]
 fn peer_allowed(stream: &UnixStream) -> bool {
-    match stream.peer_cred() {
-        Ok(cred) => {
-            let peer = cred.uid();
-            let own = unsafe { libc::geteuid() };
-            if peer == 0 || peer == own {
-                true
-            } else {
-                eprintln!("[control] refusing connection from uid {peer}");
-                false
-            }
-        }
-        Err(err) => {
-            eprintln!("[control] cannot identify peer credentials: {err:#}");
-            false
-        }
-    }
+    use std::os::unix::net::SocketExt as _;
+    let Ok(cred) = stream.peer_cred() else {
+        return false;
+    };
+    cred.uid() == 0 || cred.uid() == unsafe { libc::getuid() }
 }
 
-/// Answer one control connection: read one command line, run it and
-/// write the response back, until the client hangs up.
+/// Handle one accepted Unix connection after the credential check.
+#[cfg(unix)]
 async fn serve_conn(ctx: &Arc<Ctx>, stream: UnixStream) -> Result<()> {
-    #[cfg(unix)]
     if !peer_allowed(&stream) {
         return Ok(());
     }
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = tokio::io::BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
-        let response = dispatch(ctx, line.trim()).await;
-        let mut out = response.into_bytes();
-        if out.last() != Some(&b'\n') {
-            out.push(b'\n');
-        }
-        writer.write_all(&out).await?;
-    }
+    let (reader, writer) = stream.into_split();
+    command_loop(ctx, reader, writer).await
+}
+
+/// Handle one accepted connection on platforms without peer
+/// credentials: the loopback bind is the isolation boundary here.
+#[cfg(not(unix))]
+async fn serve_conn(ctx: &Arc<Ctx>, stream: TcpStream) -> Result<()> {
+    let (reader, writer) = stream.into_split();
+    command_loop(ctx, reader, writer).await
+}
+
+/// Read one command line, execute it and write the response; shared
+/// by every control transport.
+async fn command_loop(
+    ctx: &Arc<Ctx>,
+    reader: impl AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
+) -> Result<()> {
+    let mut lines = BufReader::new(reader).lines();
+    let Some(Ok(command)) = lines.next_line().await else {
+        return Ok(());
+    };
+    let response = dispatch(ctx, &command).await;
+    writer.write_all(response.as_bytes()).await?;
+    writer.shutdown().await?;
     Ok(())
 }
 
-/// Route one command line to its handler; every handler returns the
-/// text shown to the user.
-pub async fn dispatch(ctx: &Arc<Ctx>, command: &str) -> String {
+/// Execute one control command and render its response. The output
+/// format is a contract: `src/control/tests.rs` pins it (genesis
+/// trust 100, the `commands:` help list, the `no reputation data
+/// recorded` line).
+async fn dispatch(ctx: &Arc<Ctx>, command: &str) -> String {
     let mut parts = command.split_whitespace();
-    let cmd = parts.next().unwrap_or("");
-    let token = parts.next();
-    match (cmd, token) {
+    let Some(head) = parts.next() else {
+        return crate::control::render::help();
+    };
+    match (head, parts.next()) {
         ("status", None) => render::status(ctx).await,
         ("mode", None) => {
             let mode = ctx.state.lock().await.mode;
@@ -204,3 +224,6 @@ pub async fn dispatch(ctx: &Arc<Ctx>, command: &str) -> String {
         _ => render::help(),
     }
 }
+
+#[cfg(test)]
+mod tests;

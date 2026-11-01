@@ -1,6 +1,6 @@
 # Maintainer: OpenNet contributors <opennet@example.invalid>
 pkgname=opennet
-pkgver=0.7.0
+pkgver=0.8.0
 pkgrel=1
 pkgdesc='Peer-to-peer network for distributed computing on a LAN'
 arch=('x86_64' 'aarch64')

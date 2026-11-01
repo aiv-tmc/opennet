@@ -120,6 +120,7 @@ impl Scheduler {
             bid.trust,
             bid.consumed,
             bid.expires_unix,
+            self.running.len(),
             in_flight,
         )
         .await

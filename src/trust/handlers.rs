@@ -135,7 +135,7 @@ pub async fn handle_receipt_ack_frame(ctx: &Arc<Ctx>, src: &str, ack: Message) {
         ctx.reputation.lock().await.record_invalid(src);
         return;
     }
-    let _ = ctx
+    if ctx
         .state
         .lock()
         .await
@@ -146,7 +146,11 @@ pub async fn handle_receipt_ack_frame(ctx: &Arc<Ctx>, src: &str, ack: Message) {
             unix_ts,
             pubkey,
             signature,
-        });
+        })
+        .is_err()
+    {
+        ctx.reputation.lock().await.record_invalid(src);
+    }
 }
 
 /// Handle one inbound signed ReceiptRequest: serve one journal window
