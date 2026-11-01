@@ -6,10 +6,10 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-#[cfg(unix)]
-use tokio::net::UnixStream;
 #[cfg(not(unix))]
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 
 fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()

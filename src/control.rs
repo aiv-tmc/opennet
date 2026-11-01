@@ -10,14 +10,15 @@
 use crate::compute;
 use crate::daemon::Ctx;
 use crate::node::state::Mode;
-use crate::swarm;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
 #[cfg(not(unix))]
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+
+pub mod render;
 
 /// Spawn the control interface task.
 pub fn spawn(ctx: Arc<Ctx>) {
@@ -81,14 +82,40 @@ async fn run(ctx: Arc<Ctx>) -> Result<()> {
     }
 }
 
-/// Peer credentials on Unix: root or the daemon's own uid may command.
-#[cfg(unix)]
+/// Peer credentials on Linux: SO_PEERCRED on the socket fd; root or the
+/// daemon's own uid may command.
+#[cfg(all(unix, target_os = "linux"))]
 fn peer_allowed(stream: &UnixStream) -> bool {
-    use std::os::unix::net::SocketExt as _;
-    let Ok(cred) = stream.peer_cred() else {
-        return false;
+    use std::os::unix::io::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
     };
-    cred.uid() == 0 || cred.uid() == unsafe { libc::getuid() }
+    if rc != 0 {
+        return false;
+    }
+    cred.uid == 0 || cred.uid == unsafe { libc::getuid() }
+}
+
+/// Peer credentials on other Unix systems (macOS, BSD): getpeereid on
+/// the socket fd; root or the daemon's own uid may command.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn peer_allowed(stream: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    if rc != 0 {
+        return false;
+    }
+    uid == 0 || uid == unsafe { libc::getuid() }
 }
 
 /// Handle one accepted Unix connection after the credential check.
@@ -117,7 +144,9 @@ async fn command_loop(
     mut writer: impl AsyncWrite + Unpin,
 ) -> Result<()> {
     let mut lines = BufReader::new(reader).lines();
-    let Some(Ok(command)) = lines.next_line().await else {
+    // `next_line` yields Result<Option<String>>: end of stream or an
+    // I/O error both end the session silently.
+    let Ok(Some(command)) = lines.next_line().await else {
         return Ok(());
     };
     let response = dispatch(ctx, &command).await;
@@ -133,7 +162,7 @@ async fn command_loop(
 async fn dispatch(ctx: &Arc<Ctx>, command: &str) -> String {
     let mut parts = command.split_whitespace();
     let Some(head) = parts.next() else {
-        return crate::control::render::help();
+        return render::help();
     };
     match (head, parts.next()) {
         ("status", None) => render::status(ctx).await,
