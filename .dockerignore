@@ -1,0 +1,14 @@
+# Keep the build context small: the toolchain stage only needs the
+# crate sources, the lockfile and the benches; everything else is dead
+# weight in the context and would bust the dependency cache layer.
+target/
+.git/
+.gitignore
+*.md
+!README.md
+docs/
+benches/
+init/
+nix/
+Dockerfile
+docker-compose.yml
