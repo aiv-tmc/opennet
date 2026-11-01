@@ -12,8 +12,11 @@ through **WAN seed gossip**. Since 0.8.0 every market decision
 (accept/reject/result) is **signed**, trust claims are **evidence-gated
 at bid time** through the receipt-chain audit, and the daemon compiles
 and runs on **Windows and macOS** with a degraded (no-op) sandbox.
-Swarm mode additionally splits one shared program (e.g. a sharded
-LLM) across consenting nodes with a hot spare.
+Since 0.9.0 swarm consent is **per-program**, shard runners support
+**checkpoints** for stateful failover (wire v10), the chain audit walks
+**multi-window journals**, the sandbox works **without root** through
+user namespaces, and the daemon speaks **leveled logging** with
+**metrics counters** in `status`.
 
 ## How it works
 
@@ -34,8 +37,8 @@ LLM) across consenting nodes with a hot spare.
   numbers, and the provider signs a **receipt** committing to the charge
   and the output hash; the consumer countersigns it (`ReceiptAck`) and
   both journals chain the receipts into an auditable log. Journal
-  entries are signature-verified on append and on every replay; acks bind
-  to the receipts they countersign.
+  entries are signature-verified on append and on every replay; acks
+  bind to the receipts they countersign.
 * A node that wants work done sends a **bid** with a signed trust
   snapshot. Providers serve the highest offer first and accept only
   while `trust − consumed − in_flight ≥ min_trust`. Bid accept, reject
@@ -44,9 +47,10 @@ LLM) across consenting nodes with a hot spare.
   consumers (a wiped identity announces the genesis head) pay the
   configured stranger surcharge — Sybil resistance by pricing.
 * Trust claimed above the genesis endowment must prove itself: at bid
-  time the provider requests a signed window of the consumer's receipt
-  journal and recomputes the chain head. A mismatch — or a peer that
-  cannot answer — refuses the bid; unverifiable trust never trades.
+  time the provider requests signed windows of the consumer's receipt
+  journal and recomputes the chain head across the whole chain (16 ×
+  1024 receipts per audit). A mismatch — or a peer that cannot answer —
+  refuses the bid; unverifiable trust never trades.
 * Task assignments are signed by the same key that made the bid and
   carry a signed resource request (`--gpus N`, `--ram-mb M`); the
   provider re-checks the request against its advertised capacity before
@@ -97,8 +101,10 @@ it, and shard runners receive the same pinned environment.
 
 ## Swarm mode
 
-One shared program across consenting nodes, strictly opt-in per program.
-Manifests live in the artifacts directory as `{program}.manifest.json`:
+One shared program across consenting nodes, strictly opt-in **per
+program** (a node can host several programs at once, each with its own
+resource ceilings). Manifests live in the artifacts directory as
+`{program}.manifest.json`:
 
 ```json
 {
@@ -113,11 +119,16 @@ Manifests live in the artifacts directory as `{program}.manifest.json`:
 
 The coordinator splits the layer space proportionally to offered RAM
 (128-bit integer math, last slot takes the remainder), keeps the **last
-slot as a hot spare** (a failed shard is relaunched on the spare with the
-identical signed launch), and relays `[u32 len][u8 tag][payload]`
-frames (tags: 0 input, 1 forward, 2 output, 3 ready, 4 done) capped at
-1 MiB. `scripts/runners/pipeline-echo.sh` is a complete reference
-runner; (Inference)[https://github.com/aiv-tmc/opennet/wiki/Inference] describes the llama.cpp integration recipe.
+slot as a hot spare** (a failed shard is relaunched on the spare with
+the identical signed launch), and relays `[u32 len][u8 tag][payload]`
+frames (tags: 0 input, 1 forward, 2 output, 3 ready, 4 done, **5
+checkpoint**) capped at 1 MiB. Runners that emit checkpoint frames
+(tag 5 upstream via `ShardCheckpoint`, wire v10) resume their state on
+the spare after a failure; runners that ignore tag 5 simply restart
+cold, which stays correct for stateless programs.
+`scripts/runners/pipeline-echo.sh` is a complete reference runner;
+(Inference)[https://github.com/aiv-tmc/opennet/wiki/Inference] describes
+the llama.cpp integration recipe.
 
 ## WAN mode
 
@@ -138,24 +149,35 @@ Tasks run sandboxed (namespaces + cgroup v2), swarm runners with the
 same profile minus the network namespace. `opennetctl status` always
 reports the effective capability (`active` / `degraded` / `disabled`).
 Tuning in `[sandbox]`; `memory_mb = 0` and `cpu_percent = 0` inherit
-`[limits]`. On Windows/macOS the sandbox degrades to the no-op profile
-(working directory and environment isolation only) and the control
-endpoint is a loopback TCP listener whose address is recorded where the
-socket path would be — set `OPENNET_SOCKET` for `opennetctl` to find it.
+`[limits]`. Without root the daemon first enters a user namespace
+(`CLONE_NEWUSER` + `uid_map`/`gid_map`) and then creates the mount,
+PID and network namespaces inside it, so full isolation works on
+default kernels without privileges; on kernels that forbid unprivileged
+user namespaces the sandbox degrades with a log line. On Windows/macOS
+the sandbox degrades to the no-op profile and the control endpoint is a
+loopback TCP listener whose address is recorded where the socket path
+would be — set `OPENNET_SOCKET` for `opennetctl` to find it.
+
+## Logging and metrics
+
+Logs go to stderr with a unix timestamp, the level and the module path
+(`OPENNET_LOG=info` or `debug` for more; default `warn`).
+`opennetctl status` additionally reports live counters: tasks started,
+receipts settled and failed chain audits.
 
 ## Control interface
 
-Socket `/run/opennet/control.sock` on Unix (connections from root or the
-daemon's own uid only, `SO_PEERCRED`); a loopback TCP endpoint recorded
-in the same path on other platforms.
+Socket `/run/opennet/control.sock` on Unix (connections from root or
+the daemon's own uid only, `SO_PEERCRED`); a loopback TCP endpoint
+recorded in the same path on other platforms.
 
 | Command | Action |
 |---|---|
-| `status` | identity, trust, receipts count, sandbox capability, counters |
+| `status` | identity, trust, counters, metrics, sandbox capability, receipts |
 | `mode [peer\|seed\|leech]` | show or set operating mode |
 | `peers` / `limits` / `trust` / `reputation` | tables and economy |
 | `compute <prefix\|-> [--gpus N] [--ram-mb M] [--verify K] <cmd...>` | run a task on a peer |
-| `swarm status|enable|disable|run` | consent and plans |
+| `swarm status\|enable\|disable\|run` | per-program consent and plans |
 | `shutdown` | graceful stop |
 
 ## Configuration
@@ -180,22 +202,23 @@ mode = "peer"
 
 ## Security notes
 
-* Wire protocol v9; version negotiation precedes signature checks, and
-  every signed frame covers the version.
-* Bid decisions and results are signed by the provider; consumer waiters
-  bind by provider node id, so an injected decision from any other key
-  — even on the same listener port — cannot satisfy or poison a request.
+* Wire protocol v10; version negotiation precedes signature checks,
+  and every signed frame covers the version.
+* Bid decisions and results are signed by the provider; consumer
+  waiters bind by provider node id, so an injected decision from any
+  other key — even on the same listener port — cannot satisfy or
+  poison a request.
 * Every failed verification is penalized against the connection
   address, never a claimed node id.
-* Greetings bind the advertised address to the real socket IP (wildcard
-  rewritten to the real IP); gossiped addresses stay unverified until an
-  announcement verifies them.
+* Greetings bind the advertised address to the real socket IP
+  (wildcard rewritten to the real IP); gossiped addresses stay
+  unverified until an announcement verifies them.
 * Providers reject trust claims above the announced value, bind
   assignments to accepted bids, re-check signed resource requests, and
-  bill capped by observed wall time — with a signed receipt the consumer
-  countersigns.
-* Trust above genesis is evidence-gated: the receipt-chain audit
-  refuses mismatched or unreachable claims at bid time.
+  bill capped by observed wall time — with a signed receipt the
+  consumer countersigns.
+* Trust above genesis is evidence-gated: the window-walk receipt-chain
+  audit refuses mismatched or unreachable claims at bid time.
 * Receipt journals verify every entry's signature on append and on
   replay; acks bind to issued receipts by task id and hash.
 * Control socket: root or daemon uid only (unix); loopback-only
@@ -204,6 +227,19 @@ mode = "peer"
   receipt-chained: wiping state resets the journal to the genesis head
   and lands the new identity on stranger pricing, and receipt
   discrepancies are auditable evidence.
+* The wire decoder and the signature verifier are fuzz targets; the
+  regular suite runs a deterministic chaos decode test so the outermost
+  robustness boundary is pinned without fuzzing infrastructure.
+
+## Testing and fuzzing
+
+```sh
+cargo test --release
+OPENNET_SANDBOX_TEST=1 cargo test --release   # real namespace sandbox test
+cargo bench --bench bench                     # criterion suite
+cargo install cargo-fuzz && cargo fuzz run decode    # libFuzzer: decoder
+cargo fuzz run signing                               # libFuzzer: verifier
+```
 
 ## Benchmarks
 
@@ -220,7 +256,8 @@ cargo bench --bench bench -- --save-baseline main
    GPU shards + spare shards + bounded queues (wire v5–v7) — **done** (0.7.0).
 7. Receipt-chain audit enforcement, signed market decisions, journal
    hardening, Windows/macOS base (wire v8–v9) — **done** (0.8.0).
-8. Full gossip audit window-walk, seccomp/user-namespace sandbox,
-   `tracing` + metrics, committed bench baseline — planned (0.9.0).
-9. Stateful shard checkpointing (spare relaunch is lossless only for
-   stateless runners today), multi-program consent — planned.
+8. Multi-program consent, shard checkpoints, window-walk audits,
+   user-namespace sandbox, logging/metrics, fuzzing (wire v10) —
+   **done** (0.9.0).
+9. seccomp-bpf, tracing + Prometheus export, committed bench baseline,
+   two-node CI smoke, artifact marketplace — planned (1.0.0-candidate).
