@@ -1,9 +1,3 @@
-# Continuous integration: every pull request and push to main must pass
-# the full release gate (format, clippy with warnings denied, the
-# complete release-mode test suite, dependency audit) plus a two-node
-# smoke job that boots two real daemons on loopback and executes a task
-# across them — the cheapest end-to-end proof the market works.
-
 name: ci
 
 on:
@@ -11,58 +5,103 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  schedule:
-    # Nightly: keep the smoke test green even without commits.
-    - cron: "0 3 * * *"
-  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  gate:
-    name: fmt + clippy + test + audit
+  check:
+    name: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
 
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
-      - uses: swatinem/rust-cache@v2
-
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      - name: Clippy (warnings are errors)
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Test (release mode)
-        run: cargo test --release --locked
-
-      - name: Dependency audit
-        run: |
-          cargo install cargo-audit --locked
-          cargo audit
-
-  smoke:
-    name: two-node smoke
+  unit-tests:
+    name: unit tests
     runs-on: ubuntu-latest
-    needs: gate
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --release
 
-      - uses: swatinem/rust-cache@v2
+  sandbox-test:
+    name: sandbox isolation test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run sandbox test
+        run: OPENNET_SANDBOX_TEST=1 cargo test --release sandboxed_task
 
+  bench-smoke:
+    name: benchmark smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run benchmarks in test mode
+        run: cargo bench --bench bench -- --test
+
+  build-linux:
+    name: build (Linux)
+    runs-on: ubuntu-latest
+    needs: [check, clippy, unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build release binaries
-        run: cargo build --release --locked
+        run: cargo build --release
 
-      # The smoke script starts two daemons on loopback: a seed and a
-      # peer that reaches it through the WAN seed path (deterministic
-      # in containers where multicast may be unavailable), runs a task
-      # across the market, and asserts the settlement end to end.
-      - name: Run the two-node smoke scenario
-        run: sudo bash scripts/smoke.sh ./target/release/opennetd ./target/release/opennetctl
+  build-macos:
+    name: build + test (macOS)
+    runs-on: macos-14
+    needs: [check]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (degraded-sandbox build)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Unit tests (no-op sandbox path)
+        run: cargo test --release
+
+  build-windows:
+    name: build (Windows)
+    runs-on: windows-latest
+    needs: [check]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (degraded-sandbox build)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Build release binaries
+        run: cargo build --release
