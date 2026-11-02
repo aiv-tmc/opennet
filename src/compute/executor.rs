@@ -215,7 +215,7 @@ pub async fn execute(ctx: &Arc<Ctx>, launch: super::Launch) -> anyhow::Result<()
 /// anyway.
 async fn run_command(
     child: &mut tokio::process::Child,
-    pid: u32,
+    #[cfg_attr(not(unix), allow(unused_variables))] pid: u32,
     launch: &super::Launch,
 ) -> std::result::Result<TaskOutcome, ()> {
     let mut stdout_pipe = child
