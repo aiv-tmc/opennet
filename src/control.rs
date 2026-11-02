@@ -131,13 +131,19 @@ fn load_or_create_token(path: &std::path::Path) -> Result<String> {
 
 /// Constant-time equality for the control token: the comparison never
 /// short-circuits on the first differing byte, so response timing
-/// leaks nothing about how much of a guess was right.
+/// leaks nothing about how much of a guess was right. The length
+/// check runs separately — a token's length is not secret — and the
+/// byte loop accumulates into one byte so no platform type quirks can
+/// leak in.
 #[cfg(not(unix))]
 fn token_matches(expected: &str, presented: &str) -> bool {
     let a = expected.as_bytes();
     let b = presented.as_bytes();
-    let mut diff = a.len() ^ b.len();
-    for index in 0..a.len().min(b.len()) {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for index in 0..a.len() {
         diff |= a[index] ^ b[index];
     }
     diff == 0
