@@ -221,6 +221,7 @@ mod tests {
             timeout_secs: 60,
             ram_mb: 0,
             gpus: Vec::new(),
+            started: std::time::Instant::now(),
         };
         let mut heap = BinaryHeap::new();
         heap.push(PendingLaunch {

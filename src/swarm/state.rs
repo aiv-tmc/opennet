@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
 
 /// One coordination event of a plan, consumed by the coordinator's
-/// event loop and produced by inbound network frames.
+/// event loop and produced by inbound network frames (translated by
+/// the admission functions in `crate::swarm`) and by the local
+/// coordinator itself.
 #[derive(Clone, Debug)]
 pub enum PlanEvent {
     /// One shard reported readiness.
@@ -31,7 +33,9 @@ pub enum PlanEvent {
         /// Opaque result payload produced by the last shard.
         payload: Vec<u8>,
     },
-    /// The plan ended, carrying the human-readable reason.
+    /// The plan ended, carrying the human-readable reason: the last
+    /// shard's `"completed"`, a member's `"shard <i> launch failed:
+    /// ..."` (failover signal), or an abort reason.
     Done(String),
 }
 
@@ -39,9 +43,11 @@ pub enum PlanEvent {
 pub struct PlanState {
     /// Placement slots in shard order: where each shard runs. During
     /// failover the failed slot is rewritten in place to the spare's
-    /// address, so relays follow the replacement transparently.
+    /// address, so relays follow the replacement transparently and
+    /// the membership checks follow it too.
     pub shards: Vec<ShardSlot>,
-    /// Shards that have reported readiness so far.
+    /// Shards that have reported readiness so far; the coordinator's
+    /// readiness phase counts exactly this set.
     pub ready: HashSet<u32>,
     /// Highest accepted pipeline frame number per source shard; a
     /// frame whose number does not strictly increase the stored value
@@ -69,7 +75,9 @@ pub struct ShardSlot {
 }
 
 /// One local shard bridge registration: the bounded queue feeding the
-/// runner and the handle that ends it when the plan dies.
+/// runner, the handle that ends it when the plan dies, and the
+/// coordinator that launched the shard — the only network sender whose
+/// pipeline frames and done signals this host accepts for the shard.
 pub struct ShardProc {
     /// Index of this shard inside the plan.
     pub shard_index: u32,
@@ -79,6 +87,10 @@ pub struct ShardProc {
     /// Fired when the plan ends so the bridge tears the runner down
     /// even mid-pipeline.
     pub shutdown: oneshot::Sender<()>,
+    /// Connection address of the coordinator whose signed launch
+    /// created this shard; admission checks compare the sender of
+    /// inbound frames against it.
+    pub coordinator: String,
 }
 
 /// Registry key for one bridge inside `Ctx::swarm_procs`.

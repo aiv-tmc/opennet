@@ -12,11 +12,28 @@ through **WAN seed gossip**. Since 0.8.0 every market decision
 (accept/reject/result) is **signed**, trust claims are **evidence-gated
 at bid time** through the receipt-chain audit, and the daemon compiles
 and runs on **Windows and macOS** with a degraded (no-op) sandbox.
-Since 0.9.0 swarm consent is **per-program**, shard runners support
+Since 1.0.0 swarm consent is **per-program**, shard runners support
 **checkpoints** for stateful failover (wire v10), the chain audit walks
 **multi-window journals**, the sandbox works **without root** through
 user namespaces, and the daemon speaks **leveled logging** with
-**metrics counters** in `status`.
+**metrics counters** in `status`. Since 1.0.0 the unsigned swarm
+pipeline frames are **sender-authorized against plan membership**, so a
+foreign peer can no longer inject frames into, complete or tear down a
+plan it does not belong to; plan **readiness accounting** and
+**done-signal routing** were fixed so multi-shard plans actually reach
+completion and host-side launch failures reach the hot-spare failover;
+the transport receive counter became **strict** (one failed
+authentication ends the session, so the counter never resynchronizes
+after tampering); a node offering **zero capacity prices at zero**;
+the audit verifies the announced head **no matter how long the chain
+is** (over-budget chains verify uncached, absurdly long chains are
+refused); the provider scheduler **reclaims parked reservations** when
+their bids expire; economy arithmetic is **wide and saturating**
+throughout; the task timeout **kills and reaps the whole process
+group** on every platform; the sandbox child setup is
+**async-signal-safe** end to end; and the non-Unix control endpoint
+requires a **shared token** (constant-time checked) with an in-flight
+connection cap.
 
 ## How it works
 
@@ -49,8 +66,9 @@ user namespaces, and the daemon speaks **leveled logging** with
 * Trust claimed above the genesis endowment must prove itself: at bid
   time the provider requests signed windows of the consumer's receipt
   journal and recomputes the chain head across the whole chain (16 ×
-  1024 receipts per audit). A mismatch — or a peer that cannot answer —
-  refuses the bid; unverifiable trust never trades.
+  1024 receipts per audit, uncached verification beyond that). A
+  mismatch — or a peer that cannot answer — refuses the bid;
+  unverifiable trust never trades.
 * Task assignments are signed by the same key that made the bid and
   carry a signed resource request (`--gpus N`, `--ram-mb M`); the
   provider re-checks the request against its advertised capacity before
@@ -130,6 +148,13 @@ cold, which stays correct for stateless programs.
 (Inference)[https://github.com/aiv-tmc/opennet/wiki/Inference] describes
 the llama.cpp integration recipe.
 
+The unsigned pipeline frames (ShardFwd, ShardReady, ShardOut,
+ShardCheckpoint, SwarmDone) are admitted only from the connection the
+plan expects: the source shard's host at the coordinator, the recorded
+launch coordinator at a shard host. A member's `SwarmDone` reaches the
+coordinator's event loop — a launch failure triggers the spare
+failover, the last shard's `"completed"` ends the plan with its output.
+
 ## WAN mode
 
 ```toml
@@ -153,10 +178,14 @@ Tuning in `[sandbox]`; `memory_mb = 0` and `cpu_percent = 0` inherit
 (`CLONE_NEWUSER` + `uid_map`/`gid_map`) and then creates the mount,
 PID and network namespaces inside it, so full isolation works on
 default kernels without privileges; on kernels that forbid unprivileged
-user namespaces the sandbox degrades with a log line. On Windows/macOS
-the sandbox degrades to the no-op profile and the control endpoint is a
-loopback TCP listener whose address is recorded where the socket path
-would be — set `OPENNET_SOCKET` for `opennetctl` to find it.
+user namespaces the sandbox degrades with a log line. Everything
+between fork and exec in the sandboxed child is async-signal-safe
+(pre-formatted data, raw syscalls, no stdio). On Windows/macOS
+the sandbox degrades to the no-op profile and the control endpoint is
+a loopback TCP listener whose address is recorded where the socket path
+would be — set `OPENNET_SOCKET` for `opennetctl` to find it — and
+connections are additionally authenticated with the shared token in
+`control.token` next to the discovery file.
 
 ## Logging and metrics
 
@@ -169,7 +198,10 @@ receipts settled and failed chain audits.
 
 Socket `/run/opennet/control.sock` on Unix (connections from root or
 the daemon's own uid only, `SO_PEERCRED`); a loopback TCP endpoint
-recorded in the same path on other platforms.
+recorded in the same path on other platforms, where every connection
+must first present the shared token from `control.token` (constant-time
+check; the daemon creates the token with owner-only permissions on
+first start). Both transports cap in-flight control connections.
 
 | Command | Action |
 |---|---|
@@ -218,15 +250,28 @@ mode = "peer"
   bill capped by observed wall time — with a signed receipt the
   consumer countersigns.
 * Trust above genesis is evidence-gated: the window-walk receipt-chain
-  audit refuses mismatched or unreachable claims at bid time.
+  audit refuses mismatched or unreachable claims at bid time; the
+  announced head must verify no matter how long the chain is, and
+  chains beyond the walk cap are refused outright.
 * Receipt journals verify every entry's signature on append and on
   replay; acks bind to issued receipts by task id and hash.
-* Control socket: root or daemon uid only (unix); loopback-only
-  elsewhere.
+* Control socket: root or daemon uid only (unix); loopback plus a
+  shared constant-time-checked token elsewhere, with an in-flight
+  connection cap on both.
 * The trust economy is self-attested at the announcement level but
   receipt-chained: wiping state resets the journal to the genesis head
   and lands the new identity on stranger pricing, and receipt
   discrepancies are auditable evidence.
+* Swarm pipeline frames are admitted only from plan membership: the
+  source shard's host at the coordinator, the recorded launch
+  coordinator at a shard host; readiness, output and checkpoints only
+  from the shard the plan placed them on; done signals only from
+  members (coordinator role) or the launching coordinator (shard-host
+  role).
+* The transport receive counter is strict: TCP ordering plus one
+  nonce slot per direction, and a single failed authentication ends
+  the connection, so a replayed or tampered frame can never advance
+  or resynchronize a session.
 * The wire decoder and the signature verifier are fuzz targets; the
   regular suite runs a deterministic chaos decode test so the outermost
   robustness boundary is pinned without fuzzing infrastructure.
@@ -258,6 +303,12 @@ cargo bench --bench bench -- --save-baseline main
    hardening, Windows/macOS base (wire v8–v9) — **done** (0.8.0).
 8. Multi-program consent, shard checkpoints, window-walk audits,
    user-namespace sandbox, logging/metrics, fuzzing (wire v10) —
-   **done** (0.9.0).
-9. seccomp-bpf, tracing + Prometheus export, committed bench baseline,
-   two-node CI smoke, artifact marketplace — planned (1.0.0-candidate).
+   **done** (1.0.0).
+9. 1.0.0 hardening: swarm sender authorization, readiness/done-routing
+   fixes, strict transport counters, long-chain audit verification,
+   parked-reservation reclamation, saturating wide economy arithmetic,
+   cross-platform timeout kill+reap, async-signal-safe sandbox child,
+   control token + connection cap — **done** (1.0.0).
+10. seccomp-bpf profiles, tracing + Prometheus export, committed bench
+    baseline gate, two-node CI smoke, artifact marketplace — planned
+    (1.1).

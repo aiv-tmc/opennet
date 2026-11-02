@@ -27,6 +27,26 @@ use tokio::sync::{mpsc, Mutex};
 /// definition; `transport.rs` imports it from here.
 pub(super) type ConnMap = Arc<Mutex<HashMap<String, Arc<Conn>>>>;
 
+/// Claim one slot of the shared connection budget with a compare-and-
+/// swap loop, so concurrent accept tasks can never push the counter
+/// past the cap the way a check-then-increment pair could. Returns
+/// `false` when the budget is exhausted and the caller must drop the
+/// socket without claiming anything.
+fn claim_budget(connections: &AtomicUsize) -> bool {
+    loop {
+        let current = connections.load(Ordering::SeqCst);
+        if current >= super::MAX_CONNECTIONS {
+            return false;
+        }
+        if connections
+            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
 /// Accept loop: refuse connections once the shared budget is exhausted,
 /// then claim the budget for each accepted socket and greet. Claims of
 /// refused or failed greetings are released here; claims of established
@@ -43,14 +63,13 @@ pub(super) async fn accept_loop(
         let Ok((socket, peer_addr)) = listener.accept().await else {
             break;
         };
-        if connections.load(Ordering::SeqCst) >= super::MAX_CONNECTIONS {
+        if !claim_budget(&connections) {
             // Connection budget exhausted: drop the socket without
             // claiming anything, so slowloris-style floods cannot pin
             // the daemon at the connection ceiling.
             drop(socket);
             continue;
         }
-        connections.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(handle_inbound(
             identity.clone(),
             socket,
@@ -139,8 +158,11 @@ pub(super) fn spawn_conn_reader(
                 Ok(Ok(Some(data))) => {
                     let plain = { conn.crypto.lock().await.open(&data) };
                     let Ok(plain) = plain else {
-                        eprintln!(
-                            "[transport] frame failed to decrypt on {id}: dropping connection"
+                        crate::log::warn(
+                            module_path!(),
+                            &format!(
+                                "[transport] frame failed to decrypt on {id}: dropping connection"
+                            ),
                         );
                         break;
                     };

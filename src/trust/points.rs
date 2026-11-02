@@ -7,11 +7,15 @@
 //! CPU capacity counts whole cores (50% of 8 cores = 4 cores) and RAM
 //! capacity counts whole GiB; GPU capacity is priced separately per
 //! device so an accelerator offer does not distort the CPU/RAM price.
+//! A zero offer prices at zero: a node donating nothing announces no
+//! capacity, so leech nodes cannot inflate the market price with
+//! hardware they do not give.
 
 use crate::config::{GpuCfg, Limits, TrustCfg};
 
 /// Capacity points for the offered CPU/RAM capacity: whole cores times
-/// the per-core price plus whole GiB times the per-GiB price.
+/// the per-core price plus whole GiB times the per-GiB price. Zero
+/// offered capacity contributes zero points.
 pub fn compute_points(cfg: &TrustCfg, limits: &Limits) -> u32 {
     offered_cores(limits.cpu_percent) * cfg.points_per_core
         + offered_gib(limits.ram_mb) * cfg.points_per_gb
@@ -31,12 +35,20 @@ pub fn total_points(cfg: &TrustCfg, limits: &Limits, gpu: &GpuCfg) -> u32 {
 }
 
 /// Whole CPU cores offered at the given percent of a 4-core baseline.
+/// Any nonzero offer rounds up to one core; a zero offer stays zero.
 pub fn offered_cores(cpu_percent: u32) -> u32 {
+    if cpu_percent == 0 {
+        return 0;
+    }
     (((u64::from(cpu_percent) * 4) / 100).max(1)) as u32
 }
 
-/// Whole GiB offered.
+/// Whole GiB offered. Any nonzero offer rounds up to one GiB; a zero
+/// offer stays zero.
 pub fn offered_gib(ram_mb: u64) -> u32 {
+    if ram_mb == 0 {
+        return 0;
+    }
     ((ram_mb / 1024).max(1)) as u32
 }
 
@@ -77,6 +89,20 @@ mod tests {
         assert_eq!(offered_cores(200), 8);
         assert_eq!(offered_gib(1023), 1);
         assert_eq!(offered_gib(4096), 4);
+    }
+
+    #[test]
+    fn zero_offer_prices_at_zero() {
+        // A node donating no capacity announces no capacity: nothing
+        // may be priced from hardware the offer does not include.
+        assert_eq!(offered_cores(0), 0);
+        assert_eq!(offered_gib(0), 0);
+        let idle = Limits {
+            cpu_percent: 0,
+            ram_mb: 0,
+            max_tasks: 0,
+        };
+        assert_eq!(compute_points(&cfg(), &idle), 0);
     }
 
     #[test]

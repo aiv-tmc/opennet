@@ -15,7 +15,7 @@ use crate::compute::Launch;
 use crate::node::identity::Identity;
 use crate::testutil::{make_ctx, sandbox_test_requested};
 use crate::transport::Transport;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn launch(return_addr: &str, command: &str, timeout_secs: u64) -> Launch {
     Launch {
@@ -27,6 +27,7 @@ fn launch(return_addr: &str, command: &str, timeout_secs: u64) -> Launch {
         ram_mb: 0,
         gpus: Vec::new(),
         units: 5,
+        started: Instant::now(),
     }
 }
 
@@ -72,7 +73,8 @@ async fn successful_task_credits_trust_and_reports_output() {
         &ctx,
         launch(&consumer_side.local_id(), "echo hello-opennet", 30),
     )
-    .await;
+    .await
+    .expect("task executes and the outcome is delivered");
     let expected = 100 + ctx.state.lock().await.points as i64;
     assert_eq!(ctx.state.lock().await.trust, expected);
     assert_eq!(ctx.state.lock().await.tasks_completed, 1);
@@ -94,7 +96,8 @@ async fn failing_task_counts_failure_and_captures_stderr() {
         &ctx,
         launch(&consumer_side.local_id(), "echo oops >&2; exit 3", 30),
     )
-    .await;
+    .await
+    .expect("task executes and the outcome is delivered");
     assert_eq!(ctx.state.lock().await.tasks_failed, 1);
     let outcome = recv_outcome(&consumer_side).await;
     assert_eq!(outcome.exit_code, 3);
@@ -108,7 +111,9 @@ async fn timeout_kills_the_task_and_bills_the_limit() {
         .await
         .unwrap();
     make_consumer_known(&ctx, &consumer_side).await;
-    execute(&ctx, launch(&consumer_side.local_id(), "sleep 30", 1)).await;
+    execute(&ctx, launch(&consumer_side.local_id(), "sleep 30", 1))
+        .await
+        .expect("task executes and the outcome is delivered");
     assert_eq!(ctx.state.lock().await.tasks_failed, 1);
     let outcome = recv_outcome(&consumer_side).await;
     assert_eq!(outcome.exit_code, -2);
@@ -128,7 +133,9 @@ async fn gpu_devices_are_exported_to_the_task_environment() {
         30,
     );
     gpu_launch.gpus = vec![1, 2];
-    execute(&ctx, gpu_launch).await;
+    execute(&ctx, gpu_launch)
+        .await
+        .expect("task executes and the outcome is delivered");
     let outcome = recv_outcome(&consumer_side).await;
     assert_eq!(outcome.exit_code, 0);
     assert_eq!(outcome.stdout.trim(), "1,2");
@@ -159,7 +166,8 @@ async fn sandboxed_task_has_private_loopback_and_no_host_files() {
             30,
         ),
     )
-    .await;
+    .await
+    .expect("task executes and the outcome is delivered");
     let outcome = recv_outcome(&consumer_side).await;
     assert!(outcome.exit_code == 0);
 }

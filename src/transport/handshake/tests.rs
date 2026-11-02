@@ -39,20 +39,33 @@ fn session_roundtrip_tamper_eviction_and_ordering() {
     let first = initiator.seal(b"frame one").unwrap();
     assert_ne!(first, b"frame one", "ciphertext must not equal plaintext");
     assert_eq!(responder.open(&first).unwrap(), b"frame one");
-    // Tampering is detected and fails the session closed.
+    // Tampering is detected; the receive counter only advances on
+    // success, so the genuine frame sealed for the failed slot no
+    // longer fits its slot either, and the connection owner treats
+    // the authentication failure as fatal.
     let mut tampered = initiator.seal(b"frame two").unwrap();
     tampered[0] ^= 1;
     assert!(responder.open(&tampered).is_err());
-    // Frames must be opened in send order: counters desynchronize
-    // otherwise and authentication fails.
+    let third = initiator.seal(b"three").unwrap();
+    assert!(responder.open(&third).is_err());
+    // The reverse direction is an independent key/counter space and
+    // stays fully usable after the forward direction died.
+    let back = responder.seal(b"pong").unwrap();
+    assert_eq!(initiator.open(&back).unwrap(), b"pong");
+}
+
+#[test]
+fn frames_must_arrive_in_exactly_send_order() {
+    let (mut initiator, mut responder) = session_pair();
     let third = initiator.seal(b"three").unwrap();
     let fourth = initiator.seal(b"four").unwrap();
     assert_ne!(third, fourth, "equal-length frames still differ");
+    // Delivering the newer frame first fails; the counter has not
+    // advanced, so the older frame still opens afterwards.
     assert!(responder.open(&fourth).is_err());
     assert_eq!(responder.open(&third).unwrap(), b"three");
-    // The reverse direction uses its own key and counter space.
-    let back = responder.seal(b"pong").unwrap();
-    assert_eq!(initiator.open(&back).unwrap(), b"pong");
+    // A replayed frame from an already-consumed slot never passes.
+    assert!(responder.open(&third).is_err());
 }
 
 #[tokio::test]

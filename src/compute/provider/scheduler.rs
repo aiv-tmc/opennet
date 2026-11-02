@@ -206,11 +206,17 @@ impl Scheduler {
             timeout_secs,
             ram_mb,
             gpus: Vec::new(), // filled in when the task actually starts
+            started: std::time::Instant::now(),
         };
         if self.running.len() < self.max_tasks(ctx).await {
             self.start(ctx, task_id, bid, launch, launch_tx).await;
         } else {
-            *self.in_flight.entry(bid.from_node.clone()).or_insert(0) += bid.units;
+            // Parked tasks hold their reservation on the provider side
+            // exactly like running ones: the in-flight counter rises
+            // here and returns when the task finishes, the bid expires
+            // (see `purge_expired`) or the shutdown drain runs.
+            let counter = self.in_flight.entry(bid.from_node.clone()).or_insert(0);
+            *counter = counter.saturating_add(bid.units);
             self.order += 1;
             self.pending.push(PendingLaunch {
                 units: bid.units,

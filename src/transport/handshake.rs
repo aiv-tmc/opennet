@@ -11,7 +11,9 @@
 //! invocations, yielding one directional key per flow. Every data frame
 //! is then a ChaCha20-Poly1305 ciphertext whose nonce is a strictly
 //! increasing counter; TCP provides the ordering, the counter provides
-//! uniqueness, and an authentication failure closes the connection.
+//! uniqueness, and a single authentication failure kills the
+//! connection: the receive counter only advances on success, so the
+//! session never resynchronizes after tampering.
 
 use super::frame;
 use crate::message::{Message, PROTOCOL_VERSION};
@@ -31,11 +33,6 @@ const CONTEXT_RESPONDER_TO_INITIATOR: &str = "opennet transport v3 responder to 
 /// Counter headroom; a session is closed long before the nonce space
 /// can wrap.
 const COUNTER_LIMIT: u64 = u64::MAX - 1024;
-
-/// How many counter positions one `open` may try: the expected slot
-/// plus one position of slack, so a frame that failed authentication
-/// (or was reordered by one slot) never desynchronizes the session.
-const OPEN_SLACK: u64 = 2;
 
 /// One directional cipher state: the key and its frame counter.
 struct Direction {
@@ -81,28 +78,27 @@ impl CryptoSession {
         Ok(out)
     }
 
-    /// Decrypt one incoming frame against the expected counter slot.
-    /// With one position of slack: the expected slot is tried first,
-    /// then the next one, so a frame that failed authentication — or
-    /// arrived one slot early — never desynchronizes the session. On
-    /// success the counter advances past every slot this frame could
-    /// have occupied; on total failure the counter is left untouched,
-    /// so the genuine frame for the current slot still authenticates
-    /// afterwards. A replayed frame from an already-consumed slot can
-    /// never pass: its nonce is behind the counter, never ahead.
+    /// Decrypt one incoming frame against the exact expected counter
+    /// slot. A frame that fails authentication leaves the counter
+    /// untouched, but the connection owner closes the socket on this
+    /// error, so a tampered or reordered frame never gets a second
+    /// chance: TCP ordering guarantees the genuine frame for this slot
+    /// was already delivered or never will be, and any later frame was
+    /// sealed against a different nonce. A replayed frame from an
+    /// already-consumed slot can never pass: its nonce is behind the
+    /// counter.
     pub fn open(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        for offset in 0..OPEN_SLACK {
-            let slot = self.open.counter + offset;
-            if slot >= COUNTER_LIMIT {
-                break;
-            }
-            let nonce = Direction::nonce(slot);
-            if let Ok(out) = self.open.cipher.decrypt((&nonce).into(), ciphertext) {
-                self.open.counter = slot + 1;
-                return Ok(out);
-            }
+        if self.open.counter >= COUNTER_LIMIT {
+            bail!("session receive counter exhausted");
         }
-        Err(anyhow!("frame failed authentication"))
+        let nonce = Direction::nonce(self.open.counter);
+        let out = self
+            .open
+            .cipher
+            .decrypt((&nonce).into(), ciphertext)
+            .map_err(|_| anyhow!("frame failed authentication"))?;
+        self.open.counter += 1;
+        Ok(out)
     }
 
     /// Derive both session directions from the local ephemeral secret,

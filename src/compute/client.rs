@@ -13,9 +13,10 @@
 //! the standard defense against a provider returning fabricated output.
 //!
 //! All trust accounting happens under the single state lock through
-//! `NodeState::reserve` / `release` / `settle`. Settlement against the
-//! provider's receipt lives in `settle.rs`; redundant-execution
-//! verification lives in `verify.rs`.
+//! `NodeState::reserve` / `release` / `settle`. Reservation sizing
+//! saturates instead of overflowing: a pathological announce cannot
+//! panic the client. Settlement against the provider's receipt lives in
+//! `settle.rs`; redundant-execution verification lives in `verify.rs`.
 
 use crate::compute::policy::{announced_points, stranger_factor};
 use crate::compute::ComputeEvent;
@@ -101,7 +102,7 @@ async fn compute_once(
         ));
     };
     let factor = stranger_factor(&ctx.config, peer.receipt_head != genesis_head());
-    let max_units = units_for(points, timeout_secs) * factor;
+    let max_units = units_for(points, timeout_secs).saturating_mul(factor);
     // 128-bit random identifier: unguessable on the wire, unique across
     // retries, and the sole key of the reservation, the waiter and the
     // receipt journal entry.

@@ -2,6 +2,13 @@
 //! interface. One short-lived connection per invocation: the command
 //! line is sent as one request, the rendered response is printed to
 //! stdout, exit status follows the daemon's view of the command.
+//!
+//! On Unix the endpoint is a filesystem socket authenticated by peer
+//! credentials. Elsewhere the endpoint is a loopback listener whose
+//! address is recorded in the state directory, and the client
+//! authenticates with the shared token stored next to that discovery
+//! file — anyone who can read the token file (the daemon's own user,
+//! or an administrator) can command the daemon.
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -54,16 +61,26 @@ fn control_path() -> PathBuf {
     }
 }
 
+/// The shared control token path next to one discovery file.
+#[cfg(not(unix))]
+fn token_path(discovery: &std::path::Path) -> PathBuf {
+    discovery
+        .parent()
+        .map(|dir| dir.join("control.token"))
+        .unwrap_or_else(|| PathBuf::from("control.token"))
+}
+
 /// Connect to the daemon and run one request/response exchange. The
 /// Unix path is a filesystem socket; elsewhere the file at the path
-/// holds the `host:port` line of the daemon's loopback listener.
+/// holds the `host:port` line of the daemon's loopback listener and
+/// the connection opens with the shared token line.
 #[cfg(unix)]
 async fn exchange(socket: &std::path::Path, command: &str) -> Result<String> {
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("cannot connect to control socket {}", socket.display()))?;
     let (reader, writer) = stream.into_split();
-    transact(reader, writer, command).await
+    transact(reader, writer, None, command).await
 }
 
 #[cfg(not(unix))]
@@ -74,21 +91,39 @@ async fn exchange(socket: &std::path::Path, command: &str) -> Result<String> {
         .trim()
         .parse()
         .context("corrupt control address record")?;
+    let token = std::fs::read_to_string(token_path(socket)).with_context(|| {
+        format!(
+            "cannot read control token {}; the daemon creates it on first start",
+            token_path(socket).display()
+        )
+    })?;
     let stream = TcpStream::connect(addr)
         .await
         .with_context(|| format!("cannot connect to control listener {addr}"))?;
     let (reader, writer) = stream.into_split();
-    transact(reader, writer, command).await
+    transact(reader, writer, Some(token.trim().to_string()), command).await
 }
 
 /// Send one command and read the whole response; the daemon answers on
 /// the same connection and shuts its write half, so end of stream is
-/// the response boundary.
+/// the response boundary. On platforms without peer credentials the
+/// shared token travels as the first line, before the command.
 async fn transact(
     mut reader: impl AsyncRead + Unpin,
     mut writer: impl AsyncWrite + Unpin,
+    token: Option<String>,
     command: &str,
 ) -> Result<String> {
+    if let Some(token) = token {
+        writer
+            .write_all(token.as_bytes())
+            .await
+            .context("cannot send control token")?;
+        writer
+            .write_all(b"\n")
+            .await
+            .context("cannot flush token")?;
+    }
     writer
         .write_all(command.as_bytes())
         .await

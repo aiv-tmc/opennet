@@ -4,6 +4,14 @@
 //! daemons, and the cgroup v2 guard. Every step degrades to "no
 //! isolation" with a log line when the daemon lacks the capability,
 //! so the sandbox can never lose a task — only fail to isolate it.
+//!
+//! The `pre_exec` closure runs in the forked child between fork and
+//! exec, while the parent process is still multi-threaded: everything
+//! in it must be async-signal-safe (no allocation, no stdio, no
+//! locking libc calls). All formatting happens in the parent; the
+//! child performs raw open/write/close syscalls and silently degrades
+//! on any failure, because logging between fork and exec is itself
+//! unsafe.
 
 use super::*;
 use std::fs;
@@ -11,13 +19,41 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
+/// Async-signal-safe write of one small control file: open(2),
+/// write(2), close(2) only — no allocation, no stdio, no locks.
+fn write_ctl(path: &std::ffi::CStr, data: &[u8]) -> std::io::Result<()> {
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut written = 0usize;
+    while written < data.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                data[written..].as_ptr() as *const libc::c_void,
+                data.len() - written,
+            )
+        };
+        if n <= 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        written += n as usize;
+    }
+    unsafe { libc::close(fd) };
+    Ok(())
+}
+
 /// Enter a user namespace and map the current uid/gid to namespace
 /// root (0): on kernels that allow unprivileged user namespaces this
 /// grants CAP_SYS_ADMIN inside the new namespace tree, so the mount
 /// and namespace steps below succeed without host root. The uid/gid
 /// are read before unsharing — after `CLONE_NEWUSER` the process has
-/// no mapping yet and `getuid()` would return the overflow uid.
-fn enter_user_namespace() -> std::io::Result<()> {
+/// no mapping yet and `getuid()` would return the overflow uid. The
+/// map payloads are pre-formatted by the caller in the parent.
+fn enter_user_namespace(uid_map: &[u8], gid_map: &[u8]) -> std::io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
@@ -25,9 +61,10 @@ fn enter_user_namespace() -> std::io::Result<()> {
     }
     // deny is required before writing gid_map when the process has
     // multiple groups; harmless otherwise.
-    fs::write("/proc/self/setgroups", "deny")?;
-    fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
-    fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
+    write_ctl(c"/proc/self/setgroups", b"deny")?;
+    let _ = (uid, gid);
+    write_ctl(c"/proc/self/uid_map", uid_map)?;
+    write_ctl(c"/proc/self/gid_map", gid_map)?;
     Ok(())
 }
 
@@ -54,10 +91,16 @@ pub fn apply(
     } else {
         inherit_memory_mb
     };
+    // The uid/gid map payloads must exist before fork: formatting
+    // allocates, which the child may not do between fork and exec.
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let uid_map = format!("0 {uid} 1");
+    let gid_map = format!("0 {gid} 1");
     let std_command = command.as_std_mut();
-    // SAFETY: `pre_exec` runs in the forked child between fork and
-    // exec; the closure must be async-signal-safe, and the libc calls
-    // used here (unshare, mount, socket, ioctl, close) are.
+    // SAFETY: the closure only calls async-signal-safe libc entry
+    // points (unshare, mount, open, write, close, socket, ioctl) on
+    // pre-formatted data.
     unsafe {
         std_command.pre_exec(move || {
             if libc::unshare(flags) != 0 {
@@ -66,12 +109,11 @@ pub fn apply(
                 // first (allowed on default kernels) and retry the
                 // same flags inside it; a kernel that forbids
                 // unprivileged user namespaces degrades here, exactly
-                // like any other missing capability.
-                if enter_user_namespace().is_err() || libc::unshare(flags) != 0 {
-                    eprintln!(
-                        "[sandbox] unshare failed: {}",
-                        std::io::Error::last_os_error()
-                    );
+                // like any other missing capability. Failures degrade
+                // silently: stdio between fork and exec is unsafe.
+                if enter_user_namespace(uid_map.as_bytes(), gid_map.as_bytes()).is_err()
+                    || libc::unshare(flags) != 0
+                {
                     return Ok(());
                 }
             }
@@ -86,10 +128,6 @@ pub fn apply(
                 std::ptr::null(),
             ) != 0
             {
-                eprintln!(
-                    "[sandbox] mount(private) failed: {}",
-                    std::io::Error::last_os_error()
-                );
                 return Ok(());
             }
             if read_only_root {
@@ -106,10 +144,6 @@ pub fn apply(
                     std::ptr::null(),
                 ) != 0
                 {
-                    eprintln!(
-                        "[sandbox] remount(ro) failed: {}",
-                        std::io::Error::last_os_error()
-                    );
                     return Ok(());
                 }
             }
@@ -127,10 +161,6 @@ pub fn apply(
                 size_c.as_ptr() as *const libc::c_void,
             ) != 0
             {
-                eprintln!(
-                    "[sandbox] tmpfs failed: {}",
-                    std::io::Error::last_os_error()
-                );
                 return Ok(());
             }
             if flags & libc::CLONE_NEWNET != 0 {
@@ -146,12 +176,12 @@ pub fn apply(
 }
 
 /// Bring `lo` up inside the current (new) network namespace so
-/// sandboxed tasks see a functional loopback.
+/// sandboxed tasks see a functional loopback. Only async-signal-safe
+/// calls; failures degrade silently like the rest of the profile.
 fn bring_loopback_up() {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if fd < 0 {
-            eprintln!("[sandbox] socket: {}", std::io::Error::last_os_error());
             return;
         }
         let mut req: libc::ifreq = std::mem::zeroed();
@@ -167,9 +197,7 @@ fn bring_loopback_up() {
         if libc::ioctl(fd, 0x8913, &mut req) == 0 {
             let flags = req.ifr_ifru.ifru_flags as i32 | libc::IFF_UP | libc::IFF_RUNNING;
             req.ifr_ifru.ifru_flags = flags as libc::c_short;
-            if libc::ioctl(fd, 0x8914, &req) != 0 {
-                eprintln!("[sandbox] lo up: {}", std::io::Error::last_os_error());
-            }
+            let _ = libc::ioctl(fd, 0x8914, &req);
         }
         libc::close(fd);
     }
@@ -223,7 +251,6 @@ impl CgroupGuard {
         let attach_ok = fs::write(dir.join("cgroup.procs"), format!("{pid}")).is_ok();
         if !(memory_ok && cpu_ok && pids_ok && attach_ok) {
             // Leave the empty cgroup for the guard to remove.
-            eprintln!("[sandbox] cgroup setup failed, running without limits");
             drop(guard);
             return None;
         }

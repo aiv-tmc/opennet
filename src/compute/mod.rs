@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub mod client;
 pub mod executor;
@@ -61,6 +62,11 @@ pub struct Launch {
     pub gpus: Vec<u32>,
     /// Trust units reserved for this task.
     pub units: i64,
+    /// Billing reference point: the moment the scheduler handed the
+    /// task to the executor. The consumer measures its own wall clock
+    /// from the accept moment, so both sides of the receipt observe
+    /// (and clamp to) the same window.
+    pub started: Instant,
 }
 
 /// Events the consumer's compute request waits for.

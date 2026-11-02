@@ -5,10 +5,11 @@
 //! their offered RAM, keeps the last slot as an unlaunched spare, signs
 //! one launch per active shard, and relays pipeline frames until the
 //! last shard reports completion. When a shard host reports a launch
-//! failure, the same signed launch is re-sent to the spare, the failed
-//! slot is rewritten in place, and the pipeline continues; the
-//! replacement runner receives the failed shard's stored checkpoint
-//! through the readiness path before new input flows.
+//! failure (a member's done signal naming the shard), the same signed
+//! launch is re-sent to the spare, the failed slot is rewritten in
+//! place, and the pipeline continues; the replacement runner receives
+//! the failed shard's stored checkpoint through the readiness path
+//! before new input flows.
 
 use crate::message::Message;
 use crate::swarm::consent::ProgramSpec;
@@ -20,9 +21,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+mod abort;
 mod split;
 
 pub(crate) use split::split_layers;
+
+use abort::{abort_plan, failed_shard_index, plan_ready_count};
 
 /// Upper bound on shards per plan; keeps the signed launch set and the
 /// relay state small enough to reason about.
@@ -148,7 +152,9 @@ pub async fn run_program(ctx: &Arc<Ctx>, program: &str, prompt_path: &str) -> Re
             crate::daemon::send_msg(ctx, &slot.addr, &launch).await?;
         }
     }
-    // Wait for every active shard to report readiness.
+    // Wait for every active shard to report readiness; the readiness
+    // set inside the plan state is filled by the admission path as
+    // authorized ShardReady frames arrive.
     loop {
         let ready = plan_ready_count(ctx, &plan_id).await;
         if ready >= slots.len() {
@@ -168,10 +174,11 @@ pub async fn run_program(ctx: &Arc<Ctx>, program: &str, prompt_path: &str) -> Re
         }
     }
     // Push the prompt into the pipeline: local shard 0 takes it
-    // directly, a remote shard 0 receives it as the first frame.
+    // directly (this node is an authorized sender of its own plan), a
+    // remote shard 0 receives it as the first frame.
     match slots.first() {
         Some(slot) if slot.addr == local_addr => {
-            swarm::route_fwd(ctx, &plan_id, 1, 0, 0, prompt).await;
+            swarm::route_fwd(ctx, &local_addr, &plan_id, 1, 0, 0, prompt).await;
         }
         Some(slot) => {
             let frame = Message::ShardFwd {
@@ -185,12 +192,12 @@ pub async fn run_program(ctx: &Arc<Ctx>, program: &str, prompt_path: &str) -> Re
         }
         None => unreachable!("placement always yields at least one slot"),
     }
-    // Relay until the last shard reports completion. A shard-host
-    // launch failure arrives as a Done reason of the form "shard <i>
-    // launch failed: ..." and triggers failover onto the spare; frames
-    // in flight during the swap may be lost, which the pipeline
-    // tolerates for stateless shards, while stateful runners resume
-    // from the checkpoint the readiness path delivers to the spare.
+    // Relay until the last shard reports completion. A member's done
+    // signal with a host-side launch failure reason triggers failover
+    // onto the spare; frames in flight during the swap may be lost,
+    // which the pipeline tolerates for stateless shards, while
+    // stateful runners resume from the checkpoint the readiness path
+    // delivers to the spare.
     let mut output = Vec::new();
     loop {
         let event =
@@ -214,7 +221,7 @@ pub async fn run_program(ctx: &Arc<Ctx>, program: &str, prompt_path: &str) -> Re
                     .get(dst as usize)
                     .ok_or_else(|| anyhow::anyhow!("plan {plan_id}: bad shard index {dst}"))?;
                 if slot.addr == local_addr {
-                    swarm::route_fwd(ctx, &plan_id, seq, src, dst, payload).await;
+                    swarm::route_fwd(ctx, &local_addr, &plan_id, seq, src, dst, payload).await;
                 } else {
                     let frame = Message::ShardFwd {
                         plan_id: plan_id.clone(),
@@ -240,8 +247,9 @@ pub async fn run_program(ctx: &Arc<Ctx>, program: &str, prompt_path: &str) -> Re
                             "[swarm] plan {plan_id}: relaunching shard {index} on spare {}",
                             spare_slot.addr
                         );
-                        // Rewrite the failed slot in place (relays and
-                        // the readiness set follow the replacement) and
+                        // Rewrite the failed slot in place (relays,
+                        // readiness accounting and the membership
+                        // checks all follow the replacement) and
                         // require the spare to report ready again; the
                         // readiness event re-delivers the shard's
                         // checkpoint to the replacement runner.
@@ -272,66 +280,5 @@ pub async fn run_program(ctx: &Arc<Ctx>, program: &str, prompt_path: &str) -> Re
             }
             PlanEvent::Ready(_) => {}
         }
-    }
-}
-
-/// Extract the shard index from a host-side launch failure reason of
-/// the form "shard <index> launch failed: ...".
-fn failed_shard_index(reason: &str) -> Option<usize> {
-    let rest = reason.strip_prefix("shard ")?;
-    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-    if digits.is_empty() || !rest[digits.len()..].starts_with(" launch failed") {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-/// Current number of ready shards recorded in the plan state.
-async fn plan_ready_count(ctx: &Arc<Ctx>, plan_id: &str) -> usize {
-    ctx.swarm_plans
-        .lock()
-        .await
-        .get(plan_id)
-        .map(|plan| plan.ready.len())
-        .unwrap_or(0)
-}
-
-/// End the plan locally and tell every shard host to tear down.
-async fn abort_plan(ctx: &Arc<Ctx>, plan_id: &str, slots: &[ShardSlot], reason: &str) {
-    swarm::finish_plan(ctx, plan_id, reason).await;
-    broadcast_done(ctx, plan_id, slots, reason).await;
-}
-
-/// Send `SwarmDone` to every shard host that is not this node.
-async fn broadcast_done(ctx: &Arc<Ctx>, plan_id: &str, slots: &[ShardSlot], reason: &str) {
-    let local = ctx.transport.local_id();
-    for slot in slots {
-        if slot.addr != local {
-            let _ = crate::daemon::send_msg(
-                ctx,
-                &slot.addr,
-                &Message::SwarmDone {
-                    plan_id: plan_id.to_string(),
-                    reason: reason.to_string(),
-                },
-            )
-            .await;
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn failed_shard_index_parses_the_host_failure_reason() {
-        assert_eq!(
-            failed_shard_index("shard 3 launch failed: no consent for program demo"),
-            Some(3)
-        );
-        assert_eq!(failed_shard_index("completed"), None);
-        assert_eq!(failed_shard_index("shard x launch failed"), None);
-        assert_eq!(failed_shard_index("plan ended"), None);
     }
 }

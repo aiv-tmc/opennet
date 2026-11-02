@@ -3,6 +3,12 @@
 //! persisted atomically to `state.json`. Also owns the append-only
 //! billing receipt journal (see `receipts`) whose rolling head is
 //! announced with the identity.
+//!
+//! All economy arithmetic is evaluated in `i128` and applied with
+//! saturating operations: the trust balance, the consumption counter
+//! and the reservation totals are operator-controlled values, and a
+//! pathological combination must degrade gracefully instead of
+//! panicking on subtraction overflow.
 
 use crate::config::{Limits, TrustCfg};
 use crate::trust::points::compute_points;
@@ -47,7 +53,7 @@ impl Mode {
             "peer" => Ok(Mode::Peer),
             "seed" => Ok(Mode::Seed),
             "leech" => Ok(Mode::Leech),
-            other => anyhow::bail!("unknown mode '{other}'"),
+            other => anyhow::bail!("unknown mode '{other}"),
         }
     }
 }
@@ -151,9 +157,22 @@ impl NodeState {
         Ok(())
     }
 
-    /// Total units currently held by all reservations.
-    pub fn reserved_total(&self) -> i64 {
-        self.reservations.values().copied().sum()
+    /// Total units currently held by all reservations, summed in
+    /// `i128` so a corrupt or hostile reservation set cannot overflow
+    /// the balance math it feeds.
+    pub fn reserved_total(&self) -> i128 {
+        self.reservations
+            .values()
+            .map(|units| i128::from(*units))
+            .sum()
+    }
+
+    /// Effective trust balance in `i128`: the trust coefficient minus
+    /// the consumption counter minus every outstanding reservation.
+    /// The wide type absorbs any combination of operator-set values
+    /// without wrapping.
+    fn available(&self) -> i128 {
+        i128::from(self.trust) - i128::from(self.consumed) - self.reserved_total()
     }
 
     /// Reserve `units` for one task; the effective floor
@@ -166,10 +185,10 @@ impl NodeState {
         units: i64,
         floor: i64,
     ) -> std::result::Result<(), String> {
-        let available = self.trust - self.consumed as i64 - self.reserved_total();
-        if available - units < floor {
+        if self.available() - i128::from(units) < i128::from(floor) {
             return Err(format!(
-                "insufficient trust: available {available}, need {units} above floor {floor}"
+                "insufficient trust: available {}, need {units} above floor {floor}",
+                self.available()
             ));
         }
         self.reservations.insert(task_id.to_string(), units);
@@ -185,10 +204,14 @@ impl NodeState {
     /// Settle one reservation: move `charge` units from trust to the
     /// consumption counter and drop the reservation. The charge is
     /// already capped by the consumer side to the reservation size.
+    /// Both applications saturate: a charge that would push the
+    /// coefficient below zero clamps at zero, and the consumption
+    /// counter clamps at `u64::MAX`, so settlement cannot panic on
+    /// adversarial or corrupt balances.
     pub fn settle(&mut self, task_id: &str, charge: i64) {
         self.reservations.remove(task_id);
-        self.trust -= charge;
-        self.consumed = self.consumed.saturating_add(charge as u64);
+        self.trust = self.trust.saturating_sub(charge);
+        self.consumed = self.consumed.saturating_add(charge.max(0) as u64);
         // Settled charges must survive a crash: persist atomically on
         // every settlement.
         let _ = self.save();

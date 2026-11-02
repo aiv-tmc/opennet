@@ -142,17 +142,38 @@ impl Scheduler {
         }
     }
 
-    /// Drop expired accepted bids so expired reservations do not hold
-    /// in-flight accounting.
+    /// Expire accepted bids and queued entries past their deadline, then
+    /// reclaim parked launches whose bid is gone: a parked launch only
+    /// exists alongside its accepted bid, so once the bid expires the
+    /// heap entry is dead weight and its in-flight accounting returns
+    /// to the consumer. Without this the provider-side policy counter
+    /// inflates forever and the consumer eventually reads as insolvent,
+    /// and the heap grows without bound on nodes whose slots never free
+    /// (for example a node switched to leech mode with parked tasks).
+    /// The shutdown drain returns the same units, so a parked task
+    /// never leaks accounting on any exit path.
     fn purge_expired(&mut self) {
         let now = crate::trust::now_unix();
         self.accepted.retain(|_, bid| bid.expires_unix > now);
         self.queue.purge_expired(now);
+        let mut reclaimed: Vec<(String, i64)> = Vec::new();
+        self.pending.retain(|pending| {
+            if self.accepted.contains_key(&pending.launch.task_id) {
+                true
+            } else {
+                reclaimed.push((pending.from_node.clone(), pending.units));
+                false
+            }
+        });
+        for (from_node, units) in reclaimed {
+            self.return_units(&from_node, units);
+        }
     }
 
     /// Advertised concurrency limit: leech mode disables task execution
-    /// entirely, so the pending heap drains through rejections on the
-    /// next frees.
+    /// entirely; assignments accepted before the mode switch stay
+    /// parked until their bids expire, at which point the periodic
+    /// purge reclaims them (see `purge_expired`).
     pub(super) async fn max_tasks(&self, ctx: &Arc<Ctx>) -> usize {
         let (mode, max_tasks) = {
             let state = ctx.state.lock().await;
