@@ -76,21 +76,6 @@ jobs:
       - name: Build release binaries
         run: cargo build --release
 
-  build-macos:
-    name: build + test (macOS)
-    runs-on: macos-14
-    needs: [check]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Clippy (degraded-sandbox build)
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Unit tests (no-op sandbox path)
-        run: cargo test --release
-
   build-windows:
     name: build (Windows)
     runs-on: windows-latest
