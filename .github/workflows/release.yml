@@ -41,7 +41,7 @@ jobs:
           cp README.md LICENSE "$staging/"
           tar -czf "$staging.tar.gz" "$staging"
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: opennet-${{ matrix.target }}
           path: opennet-${{ matrix.target }}.tar.gz
@@ -74,7 +74,7 @@ jobs:
 #           cp README.md LICENSE "$staging/"
 #           tar -czf "$staging.tar.gz" "$staging"
 #       - name: Upload artifact
-#         uses: actions/upload-artifact@v4
+#         uses: actions/upload-artifact@v7
 #         with:
 #           name: opennet-macos-universal
 #           path: opennet-macos-universal.tar.gz
@@ -99,7 +99,7 @@ jobs:
           Copy-Item README.md, LICENSE $staging/
           Compress-Archive -Path $staging -DestinationPath "$staging.zip"
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: opennet-x86_64-pc-windows-msvc
           path: opennet-x86_64-pc-windows-msvc.zip
