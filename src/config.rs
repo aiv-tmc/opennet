@@ -11,8 +11,9 @@
 //! carries a container-level `serde(default)` (placed after `derive`,
 //! where derive-helper attributes belong), so a partially written
 //! table fills its omitted fields from the defaults instead of failing
-//! to parse. Cross-field validation lives in `config/validate.rs` and
-//! runs once at boot from `load`.
+//! to parse, and `deny_unknown_fields` turns a mistyped key into a
+//! boot-time error naming it. Cross-field validation lives in
+//! `config/validate.rs` and runs once at boot from `load`.
 //!
 //! The operating mode type is shared with node state: there is exactly
 //! one `Mode` enum in the crate (`node::state::Mode`), so config, state
@@ -24,6 +25,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 mod validate;
+
+#[cfg(test)]
+mod tests;
 
 fn default_mode() -> Mode {
     Mode::Peer
@@ -64,7 +68,7 @@ pub fn default_toml() -> Result<String> {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub cpu_percent: u32,
     pub ram_mb: u64,
@@ -82,7 +86,7 @@ impl Default for Limits {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GpuCfg {
     #[serde(default)]
     pub count: u32,
@@ -107,7 +111,7 @@ impl Default for GpuCfg {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TrustCfg {
     pub genesis_trust: i64,
     pub min_trust: i64,
@@ -134,8 +138,11 @@ impl Default for TrustCfg {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NetworkCfg {
+    /// Fixed TCP listen port for peer connections. A concrete default
+    /// (rather than an ephemeral port) keeps firewall rules and the
+    /// documented container port meaningful.
     pub port: u16,
     pub multicast_addr: String,
     pub multicast_port: u16,
@@ -159,7 +166,7 @@ pub struct NetworkCfg {
 impl Default for NetworkCfg {
     fn default() -> Self {
         NetworkCfg {
-            port: 0,
+            port: 7000,
             multicast_addr: "239.255.0.1".to_string(),
             multicast_port: 9999,
             hello_interval_secs: 5,
@@ -174,7 +181,7 @@ impl Default for NetworkCfg {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Paths {
     pub state_dir: PathBuf,
     pub socket_path: PathBuf,
@@ -190,7 +197,7 @@ impl Default for Paths {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SwarmCfg {
     pub enabled: bool,
     pub program: String,
@@ -212,7 +219,7 @@ impl Default for SwarmCfg {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SandboxCfg {
     pub namespaces: bool,
     pub read_only_root: bool,
@@ -236,6 +243,7 @@ impl Default for SandboxCfg {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_mode")]
     pub mode: Mode,
@@ -267,63 +275,5 @@ impl Default for Config {
             swarm: SwarmCfg::default(),
             sandbox: SandboxCfg::default(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_config_loads_from_an_empty_document() {
-        let cfg: Config = toml::from_str("").expect("empty config");
-        assert_eq!(cfg.mode, Mode::Peer);
-        assert_eq!(cfg.limits.cpu_percent, 50);
-        assert_eq!(cfg.gpu.count, 0);
-        assert_eq!(cfg.trust.new_node_units_factor, 2);
-        assert!(!cfg.network.wan);
-        assert!(cfg.network.seeds.is_empty());
-        assert_eq!(cfg.sandbox.pids_max, 512);
-    }
-
-    #[test]
-    fn wan_section_overrides_and_defaults() {
-        let text = r#"
-            [network]
-            wan = true
-            seeds = ["203.0.113.7:7000", "203.0.113.8:7000"]
-        "#;
-        let cfg: Config = toml::from_str(text).expect("wan config");
-        assert!(cfg.network.wan);
-        assert_eq!(cfg.network.seeds.len(), 2);
-        // Omitted fields inside a present section keep their defaults.
-        assert_eq!(cfg.network.port, 0);
-        assert_eq!(cfg.network.heartbeat_interval_secs, 30);
-    }
-
-    #[test]
-    fn partial_gpu_section_keeps_the_default_price() {
-        let cfg: Config = toml::from_str("[gpu]\ncount = 1\n").expect("partial gpu");
-        assert_eq!(cfg.gpu.count, 1);
-        assert_eq!(cfg.gpu.points_per_gpu, 50);
-        assert!(cfg.gpu.devices.is_empty());
-    }
-
-    #[test]
-    fn default_toml_roundtrips_through_the_loader() {
-        let text = default_toml().expect("default toml");
-        let cfg: Config = toml::from_str(&text).expect("roundtrip");
-        assert_eq!(cfg, Config::default());
-    }
-
-    #[test]
-    fn mode_names_deserialize_lowercase() {
-        #[derive(Deserialize)]
-        struct Wrap {
-            mode: Mode,
-        }
-        let wrap: Wrap = toml::from_str("mode = \"seed\"").unwrap();
-        assert_eq!(wrap.mode, Mode::Seed);
-        assert!(toml::from_str::<Wrap>("mode = \"bogus\"").is_err());
     }
 }
