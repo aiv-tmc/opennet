@@ -90,22 +90,3 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Build release binaries
         run: cargo build --release
-
-  # macOS leg is disabled while the GitHub-hosted runner images are
-  # being retired (macos-14 brownout, retirement Nov 2 2026). Re-enable
-  # as `runs-on: macos-15` once the new images are stable; the codebase
-  # is expected to pass there unchanged (degraded sandbox path).
-  # build-macos:
-  #   name: build + test (macOS)
-  #   runs-on: macos-15
-  #   needs: [check]
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: dtolnay/rust-toolchain@stable
-  #       with:
-  #         components: clippy
-  #     - uses: Swatinem/rust-cache@v2
-  #     - name: Clippy (degraded-sandbox build)
-  #       run: cargo clippy --all-targets --all-features -- -D warnings
-  #     - name: Unit tests (no-op sandbox path)
-  #       run: cargo test --release
