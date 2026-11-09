@@ -214,15 +214,10 @@ impl HwPerf {
 
     /// Total announced capacity points: measured components at their
     /// measured price, unscored components at their static price.
-    pub fn total_points(
-        &self,
-        cfg: &crate::config::Config,
-        limits: &crate::config::Limits,
-    ) -> u32 {
+    pub fn total_points(&self, cfg: &crate::config::Config, limits: &crate::config::Limits) -> u32 {
         let static_cpu =
             crate::trust::points::offered_cores(limits.cpu_percent) * cfg.trust.points_per_core;
-        let static_ram =
-            crate::trust::points::offered_gib(limits.ram_mb) * cfg.trust.points_per_gb;
+        let static_ram = crate::trust::points::offered_gib(limits.ram_mb) * cfg.trust.points_per_gb;
         let static_gpu = crate::trust::points::gpu_points(&cfg.gpu);
         if !cfg.hwperf.enabled {
             return static_cpu

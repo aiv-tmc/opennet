@@ -45,7 +45,14 @@ fn table_of_only_verified_peers_refuses_new_seeds() {
     let mut dht = Dht::new();
     for i in 0..MAX_PEERS {
         let addr = format!("tcp:10.1.{}.{}:9000", i / 256, i % 256);
-        dht.apply_ann(&addr, &format!("node-{i}"), "peer", 100, 24, crate::trust::now_unix());
+        dht.apply_ann(
+            &addr,
+            &format!("node-{i}"),
+            "peer",
+            100,
+            24,
+            crate::trust::now_unix(),
+        );
     }
     assert_eq!(dht.peer_count(), MAX_PEERS);
     dht.insert("tcp:10.9.9.9:9000");

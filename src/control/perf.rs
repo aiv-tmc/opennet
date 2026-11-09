@@ -20,7 +20,7 @@ pub(super) async fn hwperf(ctx: &Arc<Ctx>) -> String {
     );
     let render = |observed: u64, samples: u64, points: Option<u32>, unit: &str| {
         if observed == 0 {
-            format!("not measured (static price applies)")
+            "not measured (static price applies)".to_string()
         } else {
             format!(
                 "{observed} {unit} over {samples} sample(s) -> {} points",

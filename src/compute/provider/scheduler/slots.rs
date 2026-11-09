@@ -86,8 +86,11 @@ impl Scheduler {
             },
         );
         if launch_tx.send(launch).await.is_err() {
+            // The executor is gone: the task will never run, so its
+            // reservation returns with its devices.
             if let Some(running) = self.running.remove(&task_id) {
                 self.gpus.free(running.gpus);
+                self.return_units(&running.from_node, running.units);
             }
         }
     }
@@ -142,32 +145,35 @@ impl Scheduler {
         }
     }
 
-    /// Expire accepted bids and queued entries past their deadline, then
-    /// reclaim parked launches whose bid is gone: a parked launch only
-    /// exists alongside its accepted bid, so once the bid expires the
-    /// heap entry is dead weight and its in-flight accounting returns
-    /// to the consumer. Without this the provider-side policy counter
-    /// inflates forever and the consumer eventually reads as insolvent,
-    /// and the heap grows without bound on nodes whose slots never free
-    /// (for example a node switched to leech mode with parked tasks).
-    /// The shutdown drain returns the same units, so a parked task
-    /// never leaks accounting on any exit path.
+    /// Expire accepted bids and queued entries past their deadline,
+    /// returning each expired bid's reservation to its consumer, then
+    /// reclaim parked launches whose bid just expired: a parked launch
+    /// only exists alongside its accepted bid, so once the bid is gone
+    /// the heap entry is dead weight. The reservation returns exactly
+    /// once — with the expired bid, never again with the heap entry.
+    /// Without this the provider-side policy counter inflates forever
+    /// and the consumer eventually reads as insolvent, and the heap
+    /// grows without bound on nodes whose slots never free (for example
+    /// a node switched to leech mode with parked tasks). The shutdown
+    /// drain runs the same return, so a reservation never leaks on any
+    /// exit path.
     fn purge_expired(&mut self) {
         let now = crate::trust::now_unix();
-        self.accepted.retain(|_, bid| bid.expires_unix > now);
-        self.queue.purge_expired(now);
-        let mut reclaimed: Vec<(String, i64)> = Vec::new();
-        self.pending.retain(|pending| {
-            if self.accepted.contains_key(&pending.launch.task_id) {
+        let mut expired: Vec<(String, i64)> = Vec::new();
+        self.accepted.retain(|_, bid| {
+            if bid.expires_unix > now {
                 true
             } else {
-                reclaimed.push((pending.from_node.clone(), pending.units));
+                expired.push((bid.from_node.clone(), bid.units));
                 false
             }
         });
-        for (from_node, units) in reclaimed {
+        for (from_node, units) in expired {
             self.return_units(&from_node, units);
         }
+        self.queue.purge_expired(now);
+        self.pending
+            .retain(|pending| self.accepted.contains_key(&pending.launch.task_id));
     }
 
     /// Advertised concurrency limit: leech mode disables task execution

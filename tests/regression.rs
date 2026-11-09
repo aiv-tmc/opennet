@@ -29,8 +29,13 @@ fn trust_cfg() -> TrustCfg {
 #[test]
 fn negative_charge_cannot_mint_trust() {
     let dir = std::env::temp_dir().join(format!("opennet-fix1-{}", std::process::id()));
-    let mut state =
-        NodeState::load(&dir, opennet::node::state::Mode::Peer, limits(), &trust_cfg()).unwrap();
+    let mut state = NodeState::load(
+        &dir,
+        opennet::node::state::Mode::Peer,
+        limits(),
+        &trust_cfg(),
+    )
+    .unwrap();
     state.reserve("t1", 50, 0).unwrap();
     let before = state.trust;
     state.settle("t1", -1_000_000);
@@ -104,7 +109,10 @@ async fn foreign_ack_is_refused() {
             .sign(&Message::receipt_ack_signing_payload("task-x", &hash, ts))
             .to_vec(),
     };
-    assert!(log.record_ack(foreign_ack).is_err(), "foreign ack must fail");
+    assert!(
+        log.record_ack(foreign_ack).is_err(),
+        "foreign ack must fail"
+    );
     let own_ack = Message::ReceiptAck {
         task_id: "task-x".into(),
         receipt_hash: hash,
@@ -114,5 +122,8 @@ async fn foreign_ack_is_refused() {
             .sign(&Message::receipt_ack_signing_payload("task-x", &hash, ts))
             .to_vec(),
     };
-    assert!(log.record_ack(own_ack).is_ok(), "the true consumer countersigns");
+    assert!(
+        log.record_ack(own_ack).is_ok(),
+        "the true consumer countersigns"
+    );
 }

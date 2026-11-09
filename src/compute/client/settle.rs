@@ -87,6 +87,17 @@ pub(super) async fn settle_with_receipt(
         settle(ctx, task_id, fallback).await;
         return fallback;
     }
+    // The claim settles inside two bounds: never below zero (a negative
+    // charge would mint trust for the consumer), never above the local
+    // formula for the claimed duration at the announced price the
+    // consumer reserved against. A provider whose price moved since the
+    // announcement is paid the announced price — the one the consumer
+    // agreed to — and a discount claim is honored as claimed.
+    let claimed_billed = billed_secs
+        .min(started.elapsed().as_secs() + BILLING_SLACK_SECS)
+        .min(timeout_secs);
+    let honest = units_for(points, claimed_billed) * factor;
+    let bounded = honest.min(max_units);
     // The receipt is evidence: enter it into the local journal, then
     // countersign and return the ack. Either side can later present
     // the pair to prove the exact charge and output.
@@ -101,11 +112,18 @@ pub(super) async fn settle_with_receipt(
         signature,
     };
     {
+        // The consumer journals the receipt bound to itself, so only
+        // this node's own countersignature can ever settle it.
+        let self_id = ctx.identity.node_id();
         let mut state = ctx.state.lock().await;
-        if state.receipts.append(receipt_record.clone()).is_err() {
+        if state
+            .receipts
+            .append(receipt_record.clone(), &self_id)
+            .is_err()
+        {
             // A duplicate receipt (retried result) settles without
-            // re-entering the journal.
-            let charge = claimed.min(max_units);
+            // re-entering the journal, at the same bounded charge.
+            let charge = claimed.clamp(0, bounded);
             state.settle(task_id, charge);
             ctx.counters
                 .receipts_settled
@@ -132,7 +150,7 @@ pub(super) async fn settle_with_receipt(
         let _ = state.receipts.record_ack(ack.clone());
     }
     let _ = send_msg(ctx, &peer.addr, &ack).await;
-    let charge = claimed.min(max_units);
+    let charge = claimed.clamp(0, bounded);
     settle(ctx, task_id, charge).await;
     charge
 }

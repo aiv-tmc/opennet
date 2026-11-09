@@ -105,4 +105,3 @@ async fn read_capped(pipe: &mut (impl AsyncRead + Unpin), cap: usize) -> String 
     }
     text
 }
-

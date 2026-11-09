@@ -20,8 +20,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::net::{UnixListener, UnixStream};
 
 mod dispatch;
-pub mod render;
 mod perf;
+pub mod render;
 
 /// Maximum concurrently served control connections; excess accepts are
 /// dropped so control traffic cannot starve the daemon's other tasks.

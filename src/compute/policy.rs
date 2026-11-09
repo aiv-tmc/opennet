@@ -109,7 +109,15 @@ pub async fn evaluate_bid(
             }
         }
     }
-    let points = ctx.state.lock().await.points;
+    // The accept is priced in units of the unified announced capacity
+    // (measured where available, static otherwise) so the consumer's
+    // reservation, the provider's check and the executor's credit all
+    // derive from one number.
+    let points = ctx
+        .hwperf
+        .lock()
+        .await
+        .total_points(&ctx.config, &ctx.config.limits);
     let factor = stranger_factor(&ctx.config, peer.receipt_head != genesis_head());
     Decision::Accept {
         units: bid_units(&ctx.config, points).saturating_mul(factor),

@@ -64,7 +64,11 @@ fn load_factor() -> f64 {
         Ok(text) => text,
         Err(_) => return 0.0,
     };
-    let load: f64 = match loadavg.split_whitespace().next().and_then(|s| s.parse().ok()) {
+    let load: f64 = match loadavg
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+    {
         Some(v) => v,
         None => return 0.0,
     };
@@ -98,7 +102,9 @@ pub fn cpu_probe_round() -> u64 {
             });
         }
     });
-    let ops = CPU_PROBE_OPS.saturating_mul(threads as u64).saturating_mul(3);
+    let ops = CPU_PROBE_OPS
+        .saturating_mul(threads as u64)
+        .saturating_mul(3);
     let secs = start.elapsed().as_secs_f64().max(0.001);
     ((ops as f64 / secs) / 1_000_000.0) as u64
 }
@@ -141,7 +147,10 @@ pub fn gpu_utilisation() -> Option<u32> {
     }
     if count == 0 {
         if let Ok(out) = std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
+            .args([
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ])
             .output()
         {
             if out.status.success() {
@@ -154,11 +163,8 @@ pub fn gpu_utilisation() -> Option<u32> {
             }
         }
     }
-    if count == 0 {
-        None
-    } else {
-        Some((sum / count) as u32)
-    }
+    // No adapter answered on either path: report "no GPU".
+    sum.checked_div(count).map(|avg| avg as u32)
 }
 
 /// Background sampler: wakes up on the configured interval, records GPU

@@ -38,10 +38,13 @@ impl Scheduler {
                 let _ = send_msg(ctx, &from_addr, &reject).await;
             }
         }
-        // Reject every accepted bid so its consumer learns the outcome
-        // immediately.
+        // Reject every accepted bid and return its reservation so the
+        // consumer's in-flight accounting survives nothing. Parked
+        // launches still sit in this map (their reservation returns
+        // here), so the heap pass below must not return them again.
         let accepted = std::mem::take(&mut self.accepted);
         for (task_id, bid) in accepted {
+            self.return_units(&bid.from_node, bid.units);
             let reject = signed_reject(ctx, &task_id, "daemon shutting down");
             let _ = send_msg(ctx, &bid.from_addr, &reject).await;
         }
@@ -49,11 +52,10 @@ impl Scheduler {
         // clears the whole queue; the queue mirrors the accepted map,
         // which was just emptied.
         self.queue.purge_expired(0);
-        // Reject every parked launch and return its reservation so no
-        // consumer's in-flight accounting survives the daemon.
+        // Reject every parked launch; its reservation already returned
+        // with its accepted bid above.
         let pending = std::mem::take(&mut self.pending);
         for parked in pending {
-            self.return_units(&parked.from_node, parked.units);
             let reject = signed_reject(ctx, &parked.launch.task_id, "daemon shutting down");
             let _ = send_msg(ctx, &parked.launch.return_addr, &reject).await;
         }

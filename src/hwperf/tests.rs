@@ -125,8 +125,10 @@ fn corrupt_schema_version_starts_clean() {
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let file = dir.join("hwperf.json");
     // A structurally valid board stamped with an unknown schema version.
-    let mut board = ScoreBoard::default();
-    board.version = 99;
+    let board = ScoreBoard {
+        version: 99,
+        ..Default::default()
+    };
     std::fs::write(&file, serde_json::to_string(&board).expect("serialize")).expect("write");
     let perf = HwPerf::load(&dir).expect("load");
     assert_eq!(perf.board().cpu.observed_max, 0);

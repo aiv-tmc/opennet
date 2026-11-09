@@ -16,14 +16,9 @@ use crate::message::Message;
 use crate::sandbox;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use std::time::Instant;
 use tokio::process::Command;
 use tokio::sync::mpsc;
-
-/// Hard cap on captured output; beyond the cap the pipe keeps draining
-/// (and discarding) so the child never blocks on a full pipe.
-const OUTPUT_CAP: usize = 64 * 1024;
 
 /// Wait for one launch from the provider scheduler and run it; the
 /// loop ends when the launch channel closes (scheduler drained).
@@ -61,6 +56,14 @@ pub async fn execute(ctx: &Arc<Ctx>, launch: super::Launch) -> anyhow::Result<()
         .await
         .find_by_exact_node_id(&launch.from_node)
         .is_some();
+    // Unified announced capacity: measured components price from their
+    // demonstrated performance, the rest from the static offer. Read
+    // before the state lock to keep the daemon-wide lock order.
+    let points = ctx
+        .hwperf
+        .lock()
+        .await
+        .total_points(&ctx.config, &ctx.config.limits);
     let mut command = Command::new("sh");
     command.arg("-c").arg(&launch.command);
     command.stdin(Stdio::null());
@@ -134,7 +137,7 @@ pub async fn execute(ctx: &Arc<Ctx>, launch: super::Launch) -> anyhow::Result<()
             // Credited with the same charge the consumer settles
             // against; saturating arithmetic keeps a pathological
             // configuration from panicking the executor.
-            let charge = crate::trust::points::units_for(state.points, billed_secs)
+            let charge = crate::trust::points::units_for(points, billed_secs)
                 .saturating_mul(stranger_factor(&ctx.config, known));
             state.trust = state.trust.saturating_add(charge);
             state.tasks_completed += 1;
@@ -167,10 +170,21 @@ pub async fn execute(ctx: &Arc<Ctx>, launch: super::Launch) -> anyhow::Result<()
                 unix_ts: receipt_unix_ts,
                 pubkey: ctx.identity.pubkey(),
             };
-            state
-                .receipts
-                .append(receipt.clone())
-                .expect("append to a loaded receipt journal cannot fail");
+            // A journal append failure must not panic the executor: the
+            // credit is rolled back, the task is accounted as failed and
+            // no receipt leaves the node, so the local chain can never
+            // silently diverge from what consumers countersigned.
+            if let Err(err) = state.receipts.append(receipt.clone(), &launch.from_node) {
+                crate::log::warn(
+                    module_path!(),
+                    &format!("cannot append receipt for {}: {err:#}", launch.task_id),
+                );
+                state.trust = state.trust.saturating_sub(charge);
+                state.tasks_completed -= 1;
+                state.tasks_failed += 1;
+                state.release(&launch.task_id);
+                return Err(err);
+            }
             let result_unix_ts = crate::trust::now_unix();
             let result = Message::TaskResult {
                 signature: ctx
@@ -205,99 +219,9 @@ pub async fn execute(ctx: &Arc<Ctx>, launch: super::Launch) -> anyhow::Result<()
     }
 }
 
-/// Supervise the child until exit or timeout. The wait future is
-/// polled through `select!` against the timeout so the child handle
-/// stays reachable on the timeout branch: the whole process group is
-/// killed (on Unix, where the child leads its own group; elsewhere
-/// the direct child is killed, which is all the platform offers), the
-/// child is reaped, and the outcome reports the kill. Partial output
-/// of a timed-out task is discarded: the bill is the full timeout
-/// anyway.
-async fn run_command(
-    child: &mut tokio::process::Child,
-    #[cfg_attr(not(unix), allow(unused_variables))] pid: u32,
-    launch: &super::Launch,
-) -> std::result::Result<TaskOutcome, ()> {
-    let mut stdout_pipe = child
-        .stdout
-        .take()
-        .expect("stdout is piped by construction");
-    let mut stderr_pipe = child
-        .stderr
-        .take()
-        .expect("stderr is piped by construction");
-    let wait = async {
-        let (stdout, stderr, status) = tokio::join!(
-            read_capped(&mut stdout_pipe, OUTPUT_CAP),
-            read_capped(&mut stderr_pipe, OUTPUT_CAP),
-            child.wait()
-        );
-        (stdout, stderr, status)
-    };
-    let outcome = tokio::select! {
-        finished = wait => Ok(finished),
-        _ = tokio::time::sleep(Duration::from_secs(launch.timeout_secs)) => Err(()),
-    };
-    match outcome {
-        Ok((stdout, stderr, Ok(status))) => Ok(TaskOutcome {
-            exit_code: status.code().unwrap_or(-1),
-            stdout,
-            stderr,
-            billed_secs: 0,
-        }),
-        Ok((_stdout, _stderr, Err(err))) => {
-            crate::log::warn(
-                module_path!(),
-                &format!("wait failed for {}: {err:#}", launch.task_id),
-            );
-            Err(())
-        }
-        Err(()) => {
-            // The select dropped the `wait` future (releasing its
-            // child borrow), so the child handle is usable here.
-            #[cfg(unix)]
-            // SAFETY: `pid` addresses the child's own process group
-            // (created with `process_group(0)`), which the daemon is
-            // not a member of.
-            unsafe {
-                libc::killpg(pid as i32, libc::SIGKILL);
-            }
-            #[cfg(not(unix))]
-            let _ = child.start_kill();
-            // Reap the killed child so it cannot linger as a zombie.
-            let _ = child.wait().await;
-            Ok(TaskOutcome {
-                exit_code: -2,
-                stdout: String::new(),
-                stderr: "task timed out and was killed".to_string(),
-                billed_secs: 0,
-            })
-        }
-    }
-}
+mod run;
 
-/// Read one output pipe up to the cap; after the cap is reached the
-/// pipe keeps being drained (and discarded) until end of file, so the
-/// child never blocks on a full pipe even when it prints megabytes.
-async fn read_capped(pipe: &mut (impl AsyncRead + Unpin), cap: usize) -> String {
-    let mut text = String::new();
-    let mut buf = [0u8; 4096];
-    let mut budget = cap;
-    loop {
-        match pipe.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                if budget > 0 {
-                    let take = budget.min(n);
-                    text.push_str(&String::from_utf8_lossy(&buf[..take]));
-                    budget -= take;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    text
-}
+use run::run_command;
 
 #[cfg(test)]
 mod tests;

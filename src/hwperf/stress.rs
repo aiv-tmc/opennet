@@ -58,7 +58,10 @@ pub fn render(report: &StressReport) -> String {
         }
         None => out.push_str("  GPU : no adapter detected\n"),
     }
-    out.push_str(&format!("  Total hardware points: {}\n", report.total_points));
+    out.push_str(&format!(
+        "  Total hardware points: {}\n",
+        report.total_points
+    ));
     out
 }
 
@@ -84,9 +87,7 @@ pub async fn run(
     .unwrap_or(0);
 
     // Phase 2: RAM write bandwidth for RAM_RUN seconds.
-    let ram_mibs = tokio::task::spawn_blocking(ram_phase)
-        .await
-        .unwrap_or(0);
+    let ram_mibs = tokio::task::spawn_blocking(ram_phase).await.unwrap_or(0);
 
     // Phase 3: GPU observation window. Sample at 250 ms and keep the peak.
     let mut gpu_peak: Option<u32> = None;

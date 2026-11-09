@@ -126,7 +126,12 @@ impl Scheduler {
         .await
         {
             Decision::Accept { units } => {
-                self.accepted.insert(
+                // The reservation enters the consumer's in-flight
+                // accounting at accept time, not at assignment time:
+                // every outstanding acceptance must hold the consumer's
+                // balance, or a flood of accepted-but-never-assigned
+                // bids would reserve nothing and accept forever.
+                if let Some(old) = self.accepted.insert(
                     bid.task_id.clone(),
                     AcceptedBid {
                         from_node: bid.from_node.clone(),
@@ -135,7 +140,14 @@ impl Scheduler {
                         expires_unix: bid.expires_unix,
                         gpus: 0,
                     },
-                );
+                ) {
+                    // A re-bid under the same task id replaces the old
+                    // acceptance; the old reservation returns first so
+                    // the accounting never double-counts.
+                    self.return_units(&old.from_node, old.units);
+                }
+                let counter = self.in_flight.entry(bid.from_node.clone()).or_insert(0);
+                *counter = counter.saturating_add(units);
                 self.queue.push(QueuedBid {
                     task_id: bid.task_id.clone(),
                     units,
@@ -173,24 +185,31 @@ impl Scheduler {
         let Some(bid) = self.accepted.remove(&task_id) else {
             return;
         };
+        // Every refusal path below returns the reservation the accept
+        // booked, so a refused assignment never pins the consumer's
+        // in-flight accounting.
         if bid.from_node != from_node {
+            self.return_units(&bid.from_node, bid.units);
             let reject = signed_reject(ctx, &task_id, "task assignment node mismatch");
             let _ = send_msg(ctx, &bid.from_addr, &reject).await;
             return;
         }
         self.queue.remove(&task_id);
         if bid.expires_unix <= crate::trust::now_unix() {
+            self.return_units(&bid.from_node, bid.units);
             let reject = signed_reject(ctx, &task_id, "task assignment expired");
             let _ = send_msg(ctx, &bid.from_addr, &reject).await;
             return;
         }
         let offered_ram = ctx.state.lock().await.limits.ram_mb;
         if ram_mb > offered_ram {
+            self.return_units(&bid.from_node, bid.units);
             let reject = signed_reject(ctx, &task_id, "ram request exceeds offered capacity");
             let _ = send_msg(ctx, &bid.from_addr, &reject).await;
             return;
         }
         if gpus as usize > self.gpus.len() {
+            self.return_units(&bid.from_node, bid.units);
             let reject = signed_reject(ctx, &task_id, "no gpus available");
             let _ = send_msg(ctx, &bid.from_addr, &reject).await;
             return;
@@ -211,19 +230,19 @@ impl Scheduler {
         if self.running.len() < self.max_tasks(ctx).await {
             self.start(ctx, task_id, bid, launch, launch_tx).await;
         } else {
-            // Parked tasks hold their reservation on the provider side
-            // exactly like running ones: the in-flight counter rises
-            // here and returns when the task finishes, the bid expires
-            // (see `purge_expired`) or the shutdown drain runs.
-            let counter = self.in_flight.entry(bid.from_node.clone()).or_insert(0);
-            *counter = counter.saturating_add(bid.units);
+            // Parked tasks keep their accepted entry (the refill in
+            // `on_freed` needs it) and hold their reservation exactly
+            // like running ones: it was booked at accept time and
+            // returns when the task finishes, the bid expires (see
+            // `purge_expired`) or the shutdown drain runs.
             self.order += 1;
             self.pending.push(PendingLaunch {
                 units: bid.units,
                 order: self.order,
-                from_node: bid.from_node,
+                from_node: bid.from_node.clone(),
                 launch,
             });
+            self.accepted.insert(task_id, bid);
         }
     }
 }

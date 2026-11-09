@@ -60,16 +60,14 @@ pub fn valid_addr(addr: &str) -> bool {
     }
     // A dotted-quad that failed the IP parse above is not a DNS name:
     // all-numeric labels mean a malformed IP literal, not a hostname.
-    if host
-        .chars()
-        .all(|ch| ch.is_ascii_digit() || ch == '.')
-    {
+    if host.chars().all(|ch| ch.is_ascii_digit() || ch == '.') {
         return false;
     }
-    host.split('.')
-        .all(|label| !label.is_empty()
+    host.split('.').all(|label| {
+        !label.is_empty()
             && label.len() <= 63
             && label
                 .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-'))
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    })
 }

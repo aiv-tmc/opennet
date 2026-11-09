@@ -119,7 +119,10 @@ async fn run_async(config: Config, shutdown: watch::Sender<bool>) -> Result<()> 
     if !reset.is_empty() {
         crate::log::warn(
             module_path!(),
-            &format!("[hwperf] hardware change detected; reset scores: {}", reset.join(", ")),
+            &format!(
+                "[hwperf] hardware change detected; reset scores: {}",
+                reset.join(", ")
+            ),
         );
     }
     let transport = Arc::new(
