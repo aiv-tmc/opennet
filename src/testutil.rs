@@ -97,6 +97,9 @@ pub async fn make_ctx(tag: &str) -> (Arc<Ctx>, mpsc::Receiver<Cmd>) {
         receipt_windows: Arc::new(Mutex::new(HashMap::new())),
         audited_heads: Arc::new(Mutex::new(HashMap::new())),
         counters: Arc::new(crate::daemon::Counters::default()),
+        hwperf: Arc::new(Mutex::new(
+            crate::hwperf::HwPerf::load(&dir).expect("cannot load hwperf"),
+        )),
         swarm: Arc::new(Mutex::new(Consent::load(&dir, &config.swarm))),
         swarm_plans: Arc::new(Mutex::new(HashMap::<String, PlanState>::new())),
         swarm_procs: Arc::new(Mutex::new(HashMap::<String, ShardProc>::new())),

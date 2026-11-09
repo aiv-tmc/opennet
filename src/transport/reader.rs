@@ -28,11 +28,11 @@ use tokio::sync::{mpsc, Mutex};
 pub(super) type ConnMap = Arc<Mutex<HashMap<String, Arc<Conn>>>>;
 
 /// Claim one slot of the shared connection budget with a compare-and-
-/// swap loop, so concurrent accept tasks can never push the counter
-/// past the cap the way a check-then-increment pair could. Returns
-/// `false` when the budget is exhausted and the caller must drop the
-/// socket without claiming anything.
-fn claim_budget(connections: &AtomicUsize) -> bool {
+/// swap loop, so concurrent accept and dial tasks can never push the
+/// counter past the cap the way a check-then-increment pair could.
+/// Returns `false` when the budget is exhausted and the caller must
+/// drop the socket without claiming anything.
+pub(super) fn claim_budget(connections: &AtomicUsize) -> bool {
     loop {
         let current = connections.load(Ordering::SeqCst);
         if current >= super::MAX_CONNECTIONS {

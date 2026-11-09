@@ -21,6 +21,24 @@ impl Config {
         self.paths.validate()?;
         self.swarm.validate()?;
         self.sandbox.validate()?;
+        self.hwperf.validate()?;
+        Ok(())
+    }
+}
+
+impl crate::hwperf::HwPerfCfg {
+    /// Probe cadence and conversion divisors must be nonzero so the
+    /// scorer neither busy-loops nor divides by zero.
+    fn validate(&self) -> Result<()> {
+        if self.probe_interval_secs < 10 {
+            bail!("hwperf.probe_interval_secs must be at least 10");
+        }
+        if self.cpu_mops_per_point == 0 {
+            bail!("hwperf.cpu_mops_per_point must be at least 1");
+        }
+        if self.ram_mibs_per_point == 0 {
+            bail!("hwperf.ram_mibs_per_point must be at least 1");
+        }
         Ok(())
     }
 }

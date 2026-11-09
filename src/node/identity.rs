@@ -36,6 +36,26 @@ impl Identity {
     pub fn load_or_create(state_dir: &Path) -> Result<Self> {
         let path = state_dir.join("node.key");
         if let Ok(bytes) = std::fs::read(&path) {
+            // An existing key file with group/other permissions is
+            // tightened on the spot: the secret is only as safe as its
+            // file mode, and a lax mode here is operator error, not a
+            // configuration choice.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    if metadata.permissions().mode() & 0o077 != 0 {
+                        let _ = std::fs::set_permissions(
+                            &path,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                        crate::log::warn(
+                            module_path!(),
+                            &format!("tightened lax permissions on {}", path.display()),
+                        );
+                    }
+                }
+            }
             let bytes: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| anyhow!("node key file {} has invalid length", path.display()))?;

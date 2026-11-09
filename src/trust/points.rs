@@ -22,9 +22,10 @@ pub fn compute_points(cfg: &TrustCfg, limits: &Limits) -> u32 {
 }
 
 /// Capacity points contributed by the offered GPUs: one price per
-/// device, regardless of model; nodes with no GPUs add zero.
+/// effectively offered device, regardless of model; nodes with no GPUs
+/// add zero.
 pub fn gpu_points(gpu: &GpuCfg) -> u32 {
-    gpu.count.saturating_mul(gpu.points_per_gpu)
+    gpu.effective_count().saturating_mul(gpu.points_per_gpu)
 }
 
 /// Total announced capacity points: the CPU/RAM offer plus the GPU

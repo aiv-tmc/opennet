@@ -162,12 +162,23 @@ impl Transport {
         let socket_addr: SocketAddr = addr
             .parse()
             .with_context(|| format!("cannot parse peer address {addr}"))?;
-        let conn = self.connect(socket_addr).await?;
+        // Outbound dials draw from the same budget as accepted sockets:
+        // an unbounded dial loop must not push the node past the cap
+        // any more than an inbound flood may.
+        if !reader::claim_budget(&self.connections) {
+            bail!("connection budget exhausted");
+        }
+        let conn = match self.connect(socket_addr).await {
+            Ok(conn) => conn,
+            Err(err) => {
+                self.connections.fetch_sub(1, Ordering::SeqCst);
+                return Err(err);
+            }
+        };
         self.streams
             .lock()
             .await
             .insert(dest.to_string(), conn.clone());
-        self.connections.fetch_add(1, Ordering::SeqCst);
         reader::spawn_conn_reader(
             dest.to_string(),
             conn,

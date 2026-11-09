@@ -9,15 +9,22 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 /// Render the full node overview: identity, economy counters, wire
-/// health, billing metrics, sandbox capability and swarm state.
+/// health, billing metrics, sandbox capability, hardware-performance
+/// pricing and swarm state. The shown capacity is the unified
+/// announced total: measured where the hardware proved a score,
+/// static otherwise.
 pub async fn status(ctx: &Arc<Ctx>) -> String {
-    let (mode, trust, consumed, points, completed, failed, sent, received, uptime) = {
+    let points = ctx
+        .hwperf
+        .lock()
+        .await
+        .total_points(&ctx.config, &ctx.config.limits);
+    let (mode, trust, consumed, completed, failed, sent, received, uptime) = {
         let state = ctx.state.lock().await;
         (
             state.mode,
             state.trust,
             state.consumed,
-            state.points,
             state.tasks_completed,
             state.tasks_failed,
             state.msgs_sent,
@@ -119,7 +126,7 @@ pub fn limits(config: &Config) -> String {
         cpu = config.limits.cpu_percent,
         ram = config.limits.ram_mb,
         tasks = config.limits.max_tasks,
-        gpus = config.gpu.count,
+        gpus = config.gpu.effective_count(),
         devices = devices,
         ppg = config.gpu.points_per_gpu,
         ppc = config.trust.points_per_core,
@@ -130,15 +137,20 @@ pub fn limits(config: &Config) -> String {
     )
 }
 
-/// Render the trust coefficient, consumption counter and reservations.
+/// Render the trust coefficient, consumption counter, unified
+/// announced capacity and reservations.
 pub async fn trust(ctx: &Arc<Ctx>) -> String {
+    let points = ctx
+        .hwperf
+        .lock()
+        .await
+        .total_points(&ctx.config, &ctx.config.limits);
     let state = ctx.state.lock().await;
     let reserved = state.reserved_total();
     let mut out = format!(
         "trust: {trust}\nconsumed: {consumed}\npoints: {points}\n",
         trust = state.trust,
         consumed = state.consumed,
-        points = state.points,
     );
     if state.reservations.is_empty() {
         out.push_str("reservations: none\n");
@@ -259,6 +271,8 @@ pub fn help() -> String {
      compute <node_prefix|-> [--gpus N] [--ram-mb M] [--verify N] <cmd...>\n  \
      trust                           trust coefficient and reservations\n  \
      reputation                      peer reputation table\n  \
+     hwperf                          hardware performance scores and pricing\n  \
+     stress                          certify hardware performance (guided test)\n  \
      swarm status                    swarm consent, shards and plans\n  \
      swarm enable <program>          consent to host a program\n  \
      swarm disable [program]         revoke one program or all consent\n  \

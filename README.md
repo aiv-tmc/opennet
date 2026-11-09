@@ -33,7 +33,22 @@ throughout; the task timeout **kills and reaps the whole process
 group** on every platform; the sandbox child setup is
 **async-signal-safe** end to end; and the non-Unix control endpoint
 requires a **shared token** (constant-time checked) with an in-flight
-connection cap.
+connection cap. Since 1.2.0 capacity is priced from
+**demonstrated hardware performance**: the daemon keeps a per-component
+score board (CPU throughput, RAM bandwidth, GPU utilisation) that only
+grows when it *observes* the hardware deliver more than ever before —
+a game pushing the GPU to 90% sets the GPU score — and `opennetctl
+stress` certifies every ceiling on demand with one guided benchmark.
+Scores are bound to **hardware fingerprints**: swapping a component
+resets exactly its score, while a plain reboot resets nothing. The
+announced price, the provider's reservation check and the executor's
+credit are **one unified total**. The economy closed several holes:
+negative receipt charges can no longer **mint trust**, receipt acks are
+**bound to the true consumer**, the routing table is **capped and
+address-validated**, the audit walk has an **overall time budget**,
+accepted bids **hold their reservation immediately**, and outbound
+dials draw from the **same connection budget** as inbound sockets.
+
 
 ## How it works
 
@@ -210,6 +225,8 @@ first start). Both transports cap in-flight control connections.
 | `peers` / `limits` / `trust` / `reputation` | tables and economy |
 | `compute <prefix\|-> [--gpus N] [--ram-mb M] [--verify K] <cmd...>` | run a task on a peer |
 | `swarm status\|enable\|disable\|run` | per-program consent and plans |
+| `hwperf` | hardware performance scores and the price they derive |
+| `stress` | guided benchmark that certifies the hardware ceilings |
 | `shutdown` | graceful stop |
 
 ## Configuration
@@ -218,7 +235,8 @@ The daemon reads `--config` / `$OPENNET_CONFIG` / `/etc/opennet/config.toml`
 (a missing file materializes the defaults). Startup validation aborts
 boot naming the offending key. State in `state_dir`: `node.key`,
 `state.json`, `receipts.jsonl` + `receipts-acks.jsonl` (append-only,
-chained, signature-verified), `reputation.json`, `swarm.toml`.
+chained, signature-verified), `hwperf.json` (observed-maximum hardware
+scores bound to per-component fingerprints), `reputation.json`, `swarm.toml`.
 Reservations are in-memory.
 
 ```toml
@@ -230,6 +248,7 @@ mode = "peer"
 [paths]         # state_dir, socket_path
 [swarm]         # consent defaults, artifacts_dir
 [sandbox]       # namespaces, read_only_root, cgroup, memory_mb, cpu_percent, pids_max
+[hwperf]        # enabled, probe_interval_secs, cpu_mops_per_point, ram_mibs_per_point
 ```
 
 ## Security notes

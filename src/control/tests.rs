@@ -1,7 +1,7 @@
 //! Control surface tests: command dispatch, output formats, and the
 //! compute command-line parsing including the resource options.
 
-use super::*;
+use super::dispatch::dispatch;
 use crate::node::state::Mode;
 use crate::testutil::make_ctx;
 use crate::transport::Transport;

@@ -2,16 +2,13 @@
 //! and a private tmpfs scratch space, loopback bring-up inside the new
 //! network namespace, user-namespace bootstrap for unprivileged
 //! daemons, and the cgroup v2 guard. Every step degrades to "no
-//! isolation" with a log line when the daemon lacks the capability,
-//! so the sandbox can never lose a task — only fail to isolate it.
+//! isolation" when the daemon lacks the capability, so the sandbox can
+//! never lose a task — only fail to isolate it.
 //!
 //! The `pre_exec` closure runs in the forked child between fork and
 //! exec, while the parent process is still multi-threaded: everything
 //! in it must be async-signal-safe (no allocation, no stdio, no
-//! locking libc calls). All formatting happens in the parent; the
-//! child performs raw open/write/close syscalls and silently degrades
-//! on any failure, because logging between fork and exec is itself
-//! unsafe.
+//! locking libc calls). All formatting happens in the parent.
 
 use super::*;
 use std::fs;
@@ -19,8 +16,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
-/// Async-signal-safe write of one small control file: open(2),
-/// write(2), close(2) only — no allocation, no stdio, no locks.
+/// Async-signal-safe write of one small control file.
 fn write_ctl(path: &std::ffi::CStr, data: &[u8]) -> std::io::Result<()> {
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY) };
     if fd < 0 {
@@ -49,10 +45,8 @@ fn write_ctl(path: &std::ffi::CStr, data: &[u8]) -> std::io::Result<()> {
 /// Enter a user namespace and map the current uid/gid to namespace
 /// root (0): on kernels that allow unprivileged user namespaces this
 /// grants CAP_SYS_ADMIN inside the new namespace tree, so the mount
-/// and namespace steps below succeed without host root. The uid/gid
-/// are read before unsharing — after `CLONE_NEWUSER` the process has
-/// no mapping yet and `getuid()` would return the overflow uid. The
-/// map payloads are pre-formatted by the caller in the parent.
+/// and namespace steps below succeed without host root. The map
+/// payloads are pre-formatted by the caller in the parent.
 fn enter_user_namespace(uid_map: &[u8], gid_map: &[u8]) -> std::io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
@@ -68,9 +62,8 @@ fn enter_user_namespace(uid_map: &[u8], gid_map: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Shared implementation for both profiles. `pre_exec` runs in the
-/// child after fork and before exec, while it is still
-/// single-threaded; the environment scrub happens in the parent.
+/// Shared implementation for both profiles; the environment scrub
+/// happens in the parent, everything else in `pre_exec`.
 pub fn apply(
     command: &mut Command,
     workdir: &Path,
@@ -134,18 +127,17 @@ pub fn apply(
                 // Remount the root read-only; the tmpfs below still
                 // covers the workdir. Inside a user namespace this
                 // remount may fail (host mounts are not owned by the
-                // namespace root): the scratch tmpfs remains writable
-                // and the rest of the profile still applies.
-                if libc::mount(
+                // namespace root): the failure is ignored on purpose so
+                // the scratch tmpfs and the loopback setup below still
+                // run — a task with a writable root but a private
+                // scratch space is degraded, not unsandboxed.
+                let _ = libc::mount(
                     c"".as_ptr(),
                     c"/".as_ptr(),
                     std::ptr::null(),
                     libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
                     std::ptr::null(),
-                ) != 0
-                {
-                    return Ok(());
-                }
+                );
             }
             // Fresh tmpfs over the child's scratch space: the only
             // writable place the child can see, capped at half the
@@ -176,8 +168,7 @@ pub fn apply(
 }
 
 /// Bring `lo` up inside the current (new) network namespace so
-/// sandboxed tasks see a functional loopback. Only async-signal-safe
-/// calls; failures degrade silently like the rest of the profile.
+/// sandboxed tasks see a functional loopback.
 fn bring_loopback_up() {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
@@ -203,8 +194,7 @@ fn bring_loopback_up() {
     }
 }
 
-/// RAII handle to one task cgroup: removes the directory (and kills
-/// any stragglers) on drop.
+/// RAII handle to one task cgroup: teardown kills stragglers on drop.
 pub struct CgroupGuard {
     dir: PathBuf,
 }
@@ -214,8 +204,7 @@ impl CgroupGuard {
     /// apply `memory.max`, `cpu.max` and `pids.max`. Zero memory or
     /// CPU config values inherit the given task defaults. Returns
     /// `None` when the subtree is not writable: the child then runs
-    /// without cgroup limits, matching the best-effort policy of the
-    /// rest of the sandbox.
+    /// without cgroup limits, matching the best-effort policy.
     pub fn attach(
         name: &str,
         pid: u32,
@@ -257,9 +246,8 @@ impl CgroupGuard {
         Some(guard)
     }
 
-    /// Remove the task cgroup: best-effort `cgroup.kill` first to reap
-    /// stragglers, then the directory. Failing both is fine —
-    /// systemd reclaims the subtree when the unit stops.
+    /// Remove the task cgroup: best-effort `cgroup.kill` first, then
+    /// the directory; systemd reclaims the subtree on unit stop anyway.
     pub fn teardown(&self) {
         let _ = fs::write(self.dir.join("cgroup.kill"), "1");
         let _ = fs::remove_dir(&self.dir);
@@ -272,8 +260,7 @@ impl Drop for CgroupGuard {
     }
 }
 
-/// Cgroup directory names allow a restricted alphabet; map anything
-/// else to `-` so arbitrary task ids cannot escape the subtree.
+/// Cgroup directory names allow a restricted alphabet.
 fn sanitize(name: &str) -> String {
     name.chars()
         .map(|ch| {
@@ -286,11 +273,9 @@ fn sanitize(name: &str) -> String {
         .collect()
 }
 
-/// Locate the nearest cgroup v2 ancestor this process may manage: the
-/// daemon's own cgroup (the systemd unit sets `Delegate=yes`) or an
-/// explicitly delegated subtree. Probes write access by creating and
-/// removing a scratch directory; walks upward until a delegated
-/// ancestor is found. Returns `None` outside a writable subtree.
+/// Locate the nearest cgroup v2 ancestor this process may manage,
+/// probing write access by creating and removing a scratch directory
+/// and walking upward. Returns `None` outside a writable subtree.
 fn delegated_cgroup_root() -> Option<PathBuf> {
     let own = fs::read_to_string("/proc/self/cgroup").ok()?;
     let rel = own

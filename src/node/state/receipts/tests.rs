@@ -1,6 +1,7 @@
 //! Receipt journal tests: chaining, replay, windows, signature
-//! enforcement, duplicate protection and ack binding. Every case uses
-//! a scratch directory; no test touches real system paths.
+//! enforcement, duplicate protection, ack binding and the consumer
+//! binding of countersignatures. Every case uses a scratch directory;
+//! no test touches real system paths.
 
 use super::*;
 use crate::node::identity::Identity;
@@ -62,8 +63,10 @@ fn chain_advances_per_receipt_and_replays_from_disk() {
     let head_after_two;
     {
         let mut log = ReceiptLog::load(&dir).unwrap();
-        log.append(signed_receipt("t1", &provider)).unwrap();
-        log.append(signed_receipt("t2", &provider)).unwrap();
+        log.append(signed_receipt("t1", &provider), "consumer-a")
+            .unwrap();
+        log.append(signed_receipt("t2", &provider), "consumer-a")
+            .unwrap();
         head_after_two = log.head();
         assert_ne!(head_after_two, genesis_head());
         assert_eq!(log.count(), 2);
@@ -78,8 +81,11 @@ fn duplicate_task_ids_are_rejected() {
     let dir = scratch_dir("rcpt-dup");
     let provider = Identity::generate();
     let mut log = ReceiptLog::load(&dir).unwrap();
-    log.append(signed_receipt("t1", &provider)).unwrap();
-    assert!(log.append(signed_receipt("t1", &provider)).is_err());
+    log.append(signed_receipt("t1", &provider), "consumer-a")
+        .unwrap();
+    assert!(log
+        .append(signed_receipt("t1", &provider), "consumer-a")
+        .is_err());
     assert_eq!(log.count(), 1);
 }
 
@@ -92,7 +98,7 @@ fn receipt_with_invalid_signature_is_refused() {
     if let Message::Receipt { signature, .. } = &mut receipt {
         signature[0] ^= 0xff;
     }
-    assert!(log.append(receipt).is_err());
+    assert!(log.append(receipt, "consumer-a").is_err());
     assert_eq!(log.count(), 0);
 }
 
@@ -102,7 +108,8 @@ fn replay_aborts_on_tampered_evidence() {
     let provider = Identity::generate();
     {
         let mut log = ReceiptLog::load(&dir).unwrap();
-        log.append(signed_receipt("t1", &provider)).unwrap();
+        log.append(signed_receipt("t1", &provider), "consumer-a")
+            .unwrap();
     }
     // Corrupt the signature of the stored record; replay must refuse
     // to build a chain over unverifiable evidence.
@@ -120,7 +127,7 @@ fn ack_must_match_an_issued_receipt() {
     let consumer = Identity::generate();
     let mut log = ReceiptLog::load(&dir).unwrap();
     let receipt = signed_receipt("t1", &provider);
-    log.append(receipt.clone()).unwrap();
+    log.append(receipt.clone(), &consumer.node_id()).unwrap();
     // A valid ack for the issued receipt is accepted.
     assert!(log
         .record_ack(signed_ack("t1", &consumer, &receipt))
@@ -156,12 +163,37 @@ fn ack_must_match_an_issued_receipt() {
 }
 
 #[test]
+fn foreign_ack_cannot_countersign_another_consumers_receipt() {
+    let dir = scratch_dir("rcpt-foreign-ack");
+    let provider = Identity::generate();
+    let consumer = Identity::generate();
+    let stranger = Identity::generate();
+    let receipt = signed_receipt("t1", &provider);
+    // The provider's journal binds the receipt to its true consumer.
+    let mut log = ReceiptLog::load(&dir).unwrap();
+    log.append(receipt.clone(), &consumer.node_id()).unwrap();
+    // A third party holding a perfectly valid signature of its own is
+    // still refused: the signer is not the recorded consumer.
+    assert!(log
+        .record_ack(signed_ack("t1", &stranger, &receipt))
+        .is_err());
+    // The true consumer is accepted, and the binding survives replay.
+    assert!(log
+        .record_ack(signed_ack("t1", &consumer, &receipt))
+        .is_ok());
+    let mut reloaded = ReceiptLog::load(&dir).unwrap();
+    assert!(reloaded
+        .record_ack(signed_ack("t1", &stranger, &receipt))
+        .is_err());
+}
+
+#[test]
 fn windows_serve_chain_slices_with_verifiable_heads() {
     let dir = scratch_dir("rcpt-window");
     let provider = Identity::generate();
     let mut log = ReceiptLog::load(&dir).unwrap();
     for n in 1..=5 {
-        log.append(signed_receipt(&format!("t{n}"), &provider))
+        log.append(signed_receipt(&format!("t{n}"), &provider), "consumer-a")
             .unwrap();
     }
     // Full window from the genesis head reaches the live head.

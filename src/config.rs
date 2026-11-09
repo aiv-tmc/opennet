@@ -100,6 +100,20 @@ fn default_points_per_gpu() -> u32 {
     50
 }
 
+impl GpuCfg {
+    /// Number of GPUs actually offered: an explicit device list defines
+    /// the offer, so its length wins over `count`; with no list, the
+    /// plain count applies. This is the only number pricing and
+    /// announcements may use, so the two never disagree.
+    pub fn effective_count(&self) -> u32 {
+        if self.devices.is_empty() {
+            self.count
+        } else {
+            self.devices.len() as u32
+        }
+    }
+}
+
 impl Default for GpuCfg {
     fn default() -> Self {
         GpuCfg {
@@ -261,6 +275,8 @@ pub struct Config {
     pub swarm: SwarmCfg,
     #[serde(default)]
     pub sandbox: SandboxCfg,
+    #[serde(default)]
+    pub hwperf: crate::hwperf::HwPerfCfg,
 }
 
 impl Default for Config {
@@ -274,6 +290,7 @@ impl Default for Config {
             paths: Paths::default(),
             swarm: SwarmCfg::default(),
             sandbox: SandboxCfg::default(),
+            hwperf: crate::hwperf::HwPerfCfg::default(),
         }
     }
 }

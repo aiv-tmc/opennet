@@ -8,44 +8,26 @@
 //! owns no identity logic — callers verify signatures and freshness
 //! before calling `apply_ann*`, so everything stored here is already
 //! authenticated.
+//!
+//! The table is a bounded resource: `insert` refuses malformed
+//! addresses outright and, at capacity, evicts the stalest unverified
+//! entry before admitting a new seed — a gossip flood can never grow
+//! the table without limit. Swarm offers are likewise capped per peer.
 
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+mod peer;
 
-/// One signed swarm offer for one program from one peer.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct SwarmOffer {
-    /// RAM offered per shard of this program, MB.
-    pub ram_mb: u64,
-    /// CPU cores offered per shard of this program.
-    pub cores: u32,
-    /// GPU devices offered per shard of this program; 0 = CPU-only.
-    pub gpus: u32,
-}
+pub use peer::{valid_addr, PeerInfo, SwarmOffer};
 
-/// One routing-table entry; verified fields come only from signed
-/// announcements, gossiped seeds stay empty until one arrives.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PeerInfo {
-    /// Dial address of the peer, the table key.
-    pub addr: String,
-    /// Verified node id; empty while unverified.
-    pub node_id: String,
-    /// Verified operating mode name; empty while unverified.
-    pub mode: String,
-    /// Verified trust coefficient; 0 while unverified.
-    pub trust: i64,
-    /// Verified capacity points; 0 while unverified or not priced.
-    pub points: u32,
-    /// Verified GPU offer count; 0 while unverified or CPU-only.
-    pub gpus: u32,
-    /// Verified receipt journal head; genesis while unverified.
-    pub receipt_head: [u8; 32],
-    /// Unix time of the last announcement or touch.
-    pub last_seen: u64,
-    /// Swarm offers keyed by program; empty while none were announced.
-    pub swarm: BTreeMap<String, SwarmOffer>,
-}
+use std::collections::HashMap;
+
+/// Hard cap on routing-table entries. LAN tables are tens of entries;
+/// the cap only bites an active flood, and admission then evicts the
+/// stalest unverified seed rather than a verified peer.
+const MAX_PEERS: usize = 4096;
+
+/// Hard cap on swarm programs one peer may publish: a peer announcing
+/// unlimited programs would otherwise grow its entry without limit.
+const MAX_SWARM_PROGRAMS_PER_PEER: usize = 64;
 
 /// The routing table: entries keyed by address, plus a recency ring
 /// used for gossip and freshest-first listings.
@@ -73,9 +55,17 @@ impl Dht {
 
     /// Seed an unverified entry (gossip or static seed): only the
     /// address is recorded; verified fields fill in from the first
-    /// announcement. Existing entries are left untouched.
+    /// announcement. Malformed addresses are refused. At capacity the
+    /// stalest unverified entry is evicted first; a table of verified
+    /// peers refuses the seed.
     pub fn insert(&mut self, addr: &str) {
         if self.peers.contains_key(addr) {
+            return;
+        }
+        if !valid_addr(addr) {
+            return;
+        }
+        if self.peers.len() >= MAX_PEERS && !self.evict_stalest_unverified() {
             return;
         }
         let peer = PeerInfo {
@@ -87,15 +77,33 @@ impl Dht {
             gpus: 0,
             receipt_head: crate::node::state::genesis_head(),
             last_seen: crate::trust::now_unix(),
-            swarm: BTreeMap::new(),
+            swarm: Default::default(),
         };
         self.recency.push(addr.to_string());
         self.peers.insert(addr.to_string(), peer);
     }
 
+    /// Evict the oldest unverified entry, if any.
+    fn evict_stalest_unverified(&mut self) -> bool {
+        let victim = self
+            .recency
+            .iter()
+            .find(|addr| {
+                self.peers
+                    .get(*addr)
+                    .is_some_and(|peer| peer.node_id.is_empty())
+            })
+            .cloned();
+        let Some(victim) = victim else {
+            return false;
+        };
+        self.peers.remove(&victim);
+        self.recency.retain(|known| known != &victim);
+        true
+    }
+
     /// Apply one signed announcement (callers verified signature and
-    /// freshness); the short form carries no GPU offer and the genesis
-    /// receipt head.
+    /// freshness); the short form carries no GPU offer.
     pub fn apply_ann(
         &mut self,
         addr: &str,
@@ -118,9 +126,8 @@ impl Dht {
     }
 
     /// Apply one signed announcement carrying the GPU offer and the
-    /// receipt journal head. Verified fields are overwritten, the
-    /// entry becomes verified, and the address moves to the recency
-    /// tail.
+    /// receipt journal head; the entry becomes verified and moves to
+    /// the recency tail.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_ann_ext(
         &mut self,
@@ -150,8 +157,7 @@ impl Dht {
         self.recency.push(addr.to_string());
     }
 
-    /// Drop entries silent for longer than the given age; recency
-    /// entries of removed addresses go with them.
+    /// Drop entries silent for longer than the given age.
     pub fn prune(&mut self, max_age_secs: u64) {
         let now = crate::trust::now_unix();
         let stale: Vec<String> = self
@@ -166,15 +172,12 @@ impl Dht {
         }
     }
 
-    /// Number of known entries, verified and unverified: this is the
-    /// "how many nodes do we know about" figure, so gossiped seeds
-    /// count from the moment they arrive.
+    /// Number of known entries, verified and unverified.
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
 
-    /// Find one peer by node-id prefix; unknown or ambiguous prefixes
-    /// yield nothing.
+    /// Find one peer by node-id prefix; ambiguous prefixes yield nothing.
     pub fn find_by_node_id(&self, prefix: &str) -> Option<PeerInfo> {
         let mut matches = self
             .peers
@@ -187,8 +190,7 @@ impl Dht {
         Some(first.clone())
     }
 
-    /// Find one peer by its exact node id; unverified entries match
-    /// nothing.
+    /// Find one peer by its exact node id.
     pub fn find_by_exact_node_id(&self, node_id: &str) -> Option<PeerInfo> {
         self.peers
             .values()
@@ -196,13 +198,12 @@ impl Dht {
             .cloned()
     }
 
-    /// Find one entry by its dial address, whatever its verification
-    /// state.
+    /// Find one entry by its dial address.
     pub fn find_by_addr(&self, addr: &str) -> Option<PeerInfo> {
         self.peers.get(addr).cloned()
     }
 
-    /// Every verified peer in arbitrary order.
+    /// Every verified peer.
     pub fn all_peers(&self) -> Vec<PeerInfo> {
         self.peers
             .values()
@@ -211,8 +212,7 @@ impl Dht {
             .collect()
     }
 
-    /// Every verified peer ordered by announcement recency, oldest
-    /// first, so callers can pop the freshest.
+    /// Every verified peer ordered by announcement recency, oldest first.
     pub fn all_peers_by_recency(&self) -> Vec<PeerInfo> {
         self.recency
             .iter()
@@ -222,15 +222,13 @@ impl Dht {
             .collect()
     }
 
-    /// Every known address (verified and unverified) for gossip
-    /// snapshots and leave broadcasts.
+    /// Every known address for gossip snapshots and leave broadcasts.
     pub fn all_addrs(&self) -> Vec<String> {
         self.peers.keys().cloned().collect()
     }
 
     /// Announced capacity points of one node id; `None` while the node
-    /// is unverified or has not announced a positive price, so the
-    /// market treats both states as "not priced yet".
+    /// is unverified or has not announced a positive price.
     pub fn announced_points(&self, node_id: &str) -> Option<u32> {
         self.peers
             .values()
@@ -262,6 +260,9 @@ impl Dht {
         if !peer.node_id.is_empty() && peer.node_id != node_id {
             return;
         }
+        if !peer.swarm.contains_key(program) && peer.swarm.len() >= MAX_SWARM_PROGRAMS_PER_PEER {
+            return;
+        }
         peer.node_id = node_id.to_string();
         peer.last_seen = crate::trust::now_unix();
         peer.swarm.insert(
@@ -276,8 +277,7 @@ impl Dht {
         self.recency.push(addr.to_string());
     }
 
-    /// Drop every swarm offer of one node (signed retraction
-    /// received); the verified announcement fields stay.
+    /// Drop every swarm offer of one node (signed retraction received).
     pub fn clear_swarm_by_node(&mut self, node_id: &str) {
         for peer in self.peers.values_mut() {
             if peer.node_id == node_id {
@@ -287,8 +287,7 @@ impl Dht {
     }
 
     /// Placement candidates: verified peers offering `program`, most
-    /// recently announced first. GPU sufficiency is filtered by the
-    /// caller against the manifest's `gpus_per_shard`.
+    /// recently announced first.
     pub fn swarm_candidates(&self, program: &str) -> Vec<PeerInfo> {
         self.all_peers_by_recency()
             .into_iter()
@@ -296,3 +295,6 @@ impl Dht {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests;

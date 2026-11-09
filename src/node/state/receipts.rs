@@ -11,56 +11,32 @@
 //!
 //! Evidence integrity is enforced at the journal boundary: every receipt
 //! must carry a signature that verifies against its embedded provider
-//! key before it enters the chain (both on append and on every replay
-//! from disk), duplicate task ids are refused, and every ack must verify
-//! against a receipt this node actually issued — unknown task ids and
-//! hash mismatches are refused and never touch the ack journal. The
-//! full journal is held in memory (LAN-scale evidence; tens of bytes
-//! per entry) so any window can be served without re-parsing the disk
-//! log and every membership or binding check is constant time.
+//! key before it enters the chain (on append and on replay from disk),
+//! duplicate task ids are refused, and every ack must verify against a
+//! receipt this node actually issued — the ack signer must be the
+//! consumer the receipt was issued for, so a third party cannot
+//! countersign somebody else's bill. The full journal is held in memory
+//! (LAN-scale evidence; tens of bytes per entry) so any window is
+//! served without re-parsing the disk log.
 //!
 //! Storage layout in the state directory:
-//!   receipts.jsonl — one `{"receipt": <wire message>}` per line
-//!   receipts-acks.jsonl — one `{"ack": <wire message>}` per line
+//!   receipts.jsonl — `{"receipt": <wire>, "consumer": <node id>}` per line
+//!   receipts-acks.jsonl — `{"ack": <wire message>}` per line
 //! Each line stores the message through its standard serde encoding —
 //! the on-disk format is the wire format replayed. Lines are appended
 //! and flushed per record; files are owner-only.
 
+mod chain;
+
+pub use chain::{genesis_head, receipt_hash, verify_window};
+
 use crate::message::Message;
+use crate::node::identity::Identity;
 use crate::trust::verify::{verify_receipt, verify_receipt_ack};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-/// Genesis chain head: the announced head of a journal with no
-/// receipts. Distinct from any real hash by construction.
-pub fn genesis_head() -> [u8; 32] {
-    *blake3::hash(b"opennet receipt journal v1").as_bytes()
-}
-
-/// Hash of one receipt: the canonical wire bytes.
-pub fn receipt_hash(receipt: &Message) -> [u8; 32] {
-    *blake3::hash(&receipt.encode()).as_bytes()
-}
-
-/// Chain hash over a window: start at `head_before`, fold every
-/// receipt's canonical bytes in, and require the final head to equal
-/// `head_after`. Returns `false` on any non-receipt entry or a broken
-/// link; per-entry signatures are verified separately by the caller.
-pub fn verify_window(head_before: [u8; 32], receipts: &[Message], head_after: [u8; 32]) -> bool {
-    let mut head = head_before;
-    for receipt in receipts {
-        let Message::Receipt { .. } = receipt else {
-            return false;
-        };
-        let mut material = Vec::with_capacity(64);
-        material.extend_from_slice(&head);
-        material.extend_from_slice(&receipt.encode());
-        head = *blake3::hash(&material).as_bytes();
-    }
-    head == head_after
-}
 
 /// The receipt journal: a replayable chain, its on-disk append log and
 /// the in-memory index that serves audit windows.
@@ -79,6 +55,9 @@ pub struct ReceiptLog {
     task_ids: HashSet<String>,
     /// Task id -> position in `entries`: ack binding checks in O(1).
     task_index: HashMap<String, usize>,
+    /// Task id -> consumer node id the receipt was issued for: the ack
+    /// signer must equal this identity.
+    consumers: HashMap<String, String>,
 }
 
 impl ReceiptLog {
@@ -103,6 +82,7 @@ impl ReceiptLog {
             index: HashMap::new(),
             task_ids: HashSet::new(),
             task_index: HashMap::new(),
+            consumers: HashMap::new(),
         };
         log.index.insert(genesis_head(), 0);
         if receipts_file.exists() {
@@ -118,7 +98,13 @@ impl ReceiptLog {
                         .context("receipts.jsonl line without receipt field")?,
                 )
                 .context("corrupt receipt record")?;
-                log.chain(&receipt)?;
+                // Records written before consumer binding existed carry
+                // no consumer field; they replay without a signer check.
+                let consumer = parsed
+                    .get("consumer")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                log.chain(&receipt, consumer)?;
             }
         }
         if acks_file.exists() {
@@ -176,33 +162,34 @@ impl ReceiptLog {
         Some((receipts, head_after, complete))
     }
 
-    /// Append one provider-signed receipt: the signature must verify
-    /// against the embedded provider key and the task id must be new —
-    /// the chain is a set, not a multiset — then the chain advances and
-    /// the record is persisted and flushed.
-    pub fn append(&mut self, receipt: Message) -> Result<()> {
+    /// Append one provider-signed receipt issued for `consumer`: the
+    /// signature must verify and the task id must be new — the chain is
+    /// a set, not a multiset — then the record is persisted and flushed.
+    /// The consumer node id binds the later countersignature to that
+    /// consumer.
+    pub fn append(&mut self, receipt: Message, consumer: &str) -> Result<()> {
         if !matches!(receipt, Message::Receipt { .. }) {
             bail!("only Receipt messages enter the receipt journal");
         }
-        self.chain(&receipt)?;
-        append_line(&self.receipts_file, "receipt", &receipt)?;
+        self.chain(&receipt, consumer)?;
+        append_line(&self.receipts_file, "receipt", &receipt, consumer)?;
         Ok(())
     }
 
-    /// Append one countersignature record. The ack is evidence of the
-    /// consumer's consent to one exact charge, so it is bound to a
-    /// receipt this node actually issued: the task id must be known and
-    /// the carried hash must equal the stored receipt's hash, and the
-    /// signature must verify. Anything else is refused and never
-    /// reaches the ack journal.
+    /// Append one countersignature record. The ack is bound to a
+    /// receipt this node actually issued: the task id must be known,
+    /// the carried hash must equal the stored receipt's hash, the
+    /// signature must verify and the signer must be the recorded
+    /// consumer. Anything else is refused and never reaches the journal.
     pub fn record_ack(&mut self, ack: Message) -> Result<()> {
         self.verify_ack_binding(&ack)?;
-        append_line(&self.acks_file, "ack", &ack)?;
+        append_line(&self.acks_file, "ack", &ack, "")?;
         Ok(())
     }
 
     /// Check one ack against the issued-receipt set: type, signature,
-    /// known task id and matching receipt hash.
+    /// known task id, matching receipt hash and — whenever the receipt
+    /// record carries a consumer — a signer that equals that consumer.
     fn verify_ack_binding(&self, ack: &Message) -> Result<()> {
         let Message::ReceiptAck {
             task_id,
@@ -223,13 +210,18 @@ impl ReceiptLog {
         if receipt_hash(&self.entries[position]) != *ack_hash {
             bail!("ack hash does not match the issued receipt");
         }
+        if let Some(consumer) = self.consumers.get(task_id) {
+            if !consumer.is_empty() && Identity::node_id_from_pubkey(pubkey) != *consumer {
+                bail!("ack signer is not the consumer of task {task_id}");
+            }
+        }
         Ok(())
     }
 
     /// Advance the in-memory chain over one receipt, mirroring the
     /// on-disk append. Refuses non-receipts, unverifiable signatures
     /// and duplicate task ids before touching any state.
-    fn chain(&mut self, receipt: &Message) -> Result<()> {
+    fn chain(&mut self, receipt: &Message, consumer: &str) -> Result<()> {
         let Message::Receipt {
             task_id,
             provider_node,
@@ -266,6 +258,9 @@ impl ReceiptLog {
         material.extend_from_slice(&receipt.encode());
         self.head = *blake3::hash(&material).as_bytes();
         self.task_index.insert(task_id.clone(), self.entries.len());
+        if !consumer.is_empty() {
+            self.consumers.insert(task_id.clone(), consumer.to_string());
+        }
         self.entries.push(receipt.clone());
         self.heads.push(self.head);
         self.count += 1;
@@ -274,10 +269,17 @@ impl ReceiptLog {
 }
 
 /// Append one JSON line to a journal file, owner-only, flushed before
-/// returning: a receipt that survives a crash must be visible on replay.
-fn append_line(path: &Path, field: &str, message: &Message) -> Result<()> {
+/// returning: a receipt that survives a crash must be visible on
+/// replay. A non-empty `consumer` is stored next to the record.
+fn append_line(path: &Path, field: &str, message: &Message, consumer: &str) -> Result<()> {
     let mut wrapper = serde_json::Map::new();
     wrapper.insert(field.to_string(), serde_json::to_value(message)?);
+    if !consumer.is_empty() {
+        wrapper.insert(
+            "consumer".to_string(),
+            serde_json::Value::String(consumer.to_string()),
+        );
+    }
     let line = serde_json::to_string(&serde_json::Value::Object(wrapper))?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)

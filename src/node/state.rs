@@ -203,15 +203,18 @@ impl NodeState {
 
     /// Settle one reservation: move `charge` units from trust to the
     /// consumption counter and drop the reservation. The charge is
-    /// already capped by the consumer side to the reservation size.
-    /// Both applications saturate: a charge that would push the
-    /// coefficient below zero clamps at zero, and the consumption
-    /// counter clamps at `u64::MAX`, so settlement cannot panic on
-    /// adversarial or corrupt balances.
+    /// already capped by the consumer side to the reservation size, and
+    /// it is clamped to zero here as well: a negative charge must never
+    /// mint trust, no matter which caller path produced it. Both
+    /// applications saturate: a charge that would push the coefficient
+    /// below zero clamps at zero, and the consumption counter clamps at
+    /// `u64::MAX`, so settlement cannot panic on adversarial or corrupt
+    /// balances.
     pub fn settle(&mut self, task_id: &str, charge: i64) {
         self.reservations.remove(task_id);
+        let charge = charge.max(0);
         self.trust = self.trust.saturating_sub(charge);
-        self.consumed = self.consumed.saturating_add(charge.max(0) as u64);
+        self.consumed = self.consumed.saturating_add(charge as u64);
         // Settled charges must survive a crash: persist atomically on
         // every settlement.
         let _ = self.save();

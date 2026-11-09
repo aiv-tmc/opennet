@@ -11,6 +11,7 @@ pub mod dht;
 pub mod discovery;
 pub mod dispatch;
 pub mod heartbeat;
+pub mod hwperf;
 pub mod init;
 pub mod log;
 pub mod message;

@@ -14,10 +14,12 @@
 //! (comfortably inside the 1 MiB frame cap). A chain that outlasts
 //! `AUDIT_MAX_WINDOWS` keeps being walked — the announced head must
 //! verify no matter how long the chain is — but the result is not
-//! cached, so an over-budget claim is re-verified on every bid. A
-//! chain longer than `AUDIT_HARD_CAP` windows fails the audit: that
-//! much evidence cannot be fetched inside any reasonable bid
-//! deadline, and unverifiable trust never trades.
+//! cached, so an over-budget claim is re-verified on every bid. Two
+//! backstops keep the walk from monopolizing the bidder: the window
+//! count is capped at `AUDIT_HARD_CAP`, and the whole walk must finish
+//! inside `AUDIT_OVERALL_TIMEOUT` no matter how the peer paces its
+//! answers, so a slow-dripping peer cannot stall the scheduler for
+//! hours one window at a time.
 
 use super::verify::{verify_receipt, verify_receipt_response};
 use crate::daemon::{send_msg, Ctx};
@@ -27,7 +29,7 @@ use crate::node::state::{genesis_head, verify_window};
 use anyhow::{bail, Result};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Cap on receipts per audit window: keeps the response comfortably
 /// inside the 1 MiB frame cap.
@@ -47,6 +49,12 @@ const AUDIT_HARD_CAP: usize = 4096;
 /// Ten seconds per window; a slow peer fails the audit.
 pub const AUDIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Overall wall-clock budget for one full walk, independent of the
+/// per-window timeout: a peer answering every window just inside its
+/// own deadline still fails here, so the total scheduler stall stays
+/// bounded by one constant.
+const AUDIT_OVERALL_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// One verified window's outcome.
 enum Window {
     /// The window verified: verified head after it, and whether the
@@ -64,7 +72,7 @@ enum Window {
 /// `Ok(true)` when the chain verifies (or was already audited for this
 /// head), `Ok(false)` when the presented evidence is a forgery, and
 /// `Err` when the peer cannot produce evidence at all or the chain
-/// outlasts the hard walk cap — callers treat `Err` as "audit
+/// outlasts the walk budgets — callers treat `Err` as "audit
 /// unavailable" and `Ok(false)` as "liar, refuse".
 pub async fn audit_chain(ctx: &Arc<Ctx>, peer: &PeerInfo, expected_head: [u8; 32]) -> Result<bool> {
     {
@@ -76,6 +84,7 @@ pub async fn audit_chain(ctx: &Arc<Ctx>, peer: &PeerInfo, expected_head: [u8; 32
             return Ok(true);
         }
     }
+    let deadline = Instant::now() + AUDIT_OVERALL_TIMEOUT;
     let mut head_before = genesis_head();
     let mut verified_head = genesis_head();
     let mut complete = false;
@@ -85,6 +94,9 @@ pub async fn audit_chain(ctx: &Arc<Ctx>, peer: &PeerInfo, expected_head: [u8; 32
             return Err(anyhow::anyhow!(
                 "chain longer than {AUDIT_HARD_CAP} windows; audit aborted"
             ));
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!("audit exceeded its overall time budget"));
         }
         windows += 1;
         let request_id: [u8; 32] = rand::random();
@@ -108,9 +120,13 @@ pub async fn audit_chain(ctx: &Arc<Ctx>, peer: &PeerInfo, expected_head: [u8; 32
             unix_ts,
             pubkey: ctx.identity.pubkey(),
         };
+        // The per-window wait is the tighter of the window timeout and
+        // the remaining overall budget, so the last window can never
+        // overshoot the deadline.
+        let remaining = deadline.saturating_duration_since(Instant::now());
         let outcome = async {
             send_msg(ctx, &peer.addr, &request).await?;
-            tokio::time::timeout(AUDIT_TIMEOUT, rx)
+            tokio::time::timeout(remaining.min(AUDIT_TIMEOUT), rx)
                 .await
                 .map_err(|_| anyhow::anyhow!("audit window timed out"))?
                 .map_err(|_| anyhow::anyhow!("audit waiter dropped"))
@@ -246,115 +262,4 @@ async fn verify_window_response(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::node::identity::Identity;
-    use crate::node::state::ReceiptLog;
-    use crate::testutil::scratch_dir;
-    use crate::trust::now_unix;
-
-    fn signed_receipt(task_id: &str, provider: &Identity) -> Message {
-        let unix_ts = now_unix();
-        Message::Receipt {
-            task_id: task_id.to_string(),
-            provider_node: provider.node_id(),
-            billed_secs: 12,
-            charge: 24,
-            outcome_hash: [7; 32],
-            unix_ts,
-            pubkey: provider.pubkey(),
-            signature: provider
-                .sign(&Message::receipt_signing_payload(
-                    task_id,
-                    &provider.node_id(),
-                    12,
-                    24,
-                    &[7; 32],
-                    unix_ts,
-                ))
-                .to_vec(),
-        }
-    }
-
-    /// Mirror of the walk loop in `audit_chain` against a real
-    /// journal: the walk chains bounded windows from the genesis
-    /// anchor to the live head. `max_windows` models only the hard
-    /// walk cap (`AUDIT_HARD_CAP`): the cache budget never bounds the
-    /// walk, which must reach the chain end before anything is
-    /// accepted.
-    fn simulated_walk(log: &ReceiptLog, window_cap: usize, max_windows: usize) -> Option<[u8; 32]> {
-        let mut anchor = genesis_head();
-        let mut final_head = genesis_head();
-        let mut complete = false;
-        let mut windows = 0usize;
-        while !complete && windows < max_windows {
-            windows += 1;
-            let (receipts, head_after, done) = log.window(anchor, window_cap)?;
-            assert!(verify_window(anchor, &receipts, head_after));
-            final_head = head_after;
-            complete = done;
-            anchor = head_after;
-        }
-        complete.then_some(final_head)
-    }
-
-    #[test]
-    fn multi_window_walk_recomputes_the_full_chain_head() {
-        let dir = scratch_dir("audit-walk");
-        let provider = Identity::generate();
-        let mut log = ReceiptLog::load(&dir).unwrap();
-        for n in 1..=5 {
-            log.append(signed_receipt(&format!("t{n}"), &provider))
-                .unwrap();
-        }
-        let head = simulated_walk(&log, 3, 16).expect("five receipts must fit the budget");
-        assert_eq!(head, log.head());
-        // Two of five receipts can never reach the head: skipping
-        // evidence must not verify.
-        let (first, head_after_first, done_first) = log.window(genesis_head(), 1).unwrap();
-        assert!(!done_first);
-        assert!(verify_window(genesis_head(), &first, head_after_first));
-        let (second, head_after_second, _) = log.window(head_after_first, 1).unwrap();
-        assert!(verify_window(head_after_first, &second, head_after_second));
-        assert_ne!(
-            head_after_second,
-            log.head(),
-            "two of five cannot reach the head"
-        );
-    }
-
-    #[test]
-    fn walk_past_the_cache_budget_still_reaches_the_head() {
-        // Eleven receipts at a window cap of five need three windows,
-        // more than the two-window cache budget: the cache budget must
-        // never stop the walk — only the hard walk cap bounds it — and
-        // the walk must still land on the real head, because the
-        // announced head is compared on every path.
-        let dir = scratch_dir("audit-long");
-        let provider = Identity::generate();
-        let mut log = ReceiptLog::load(&dir).unwrap();
-        for n in 1..=11 {
-            log.append(signed_receipt(&format!("t{n}"), &provider))
-                .unwrap();
-        }
-        let head = simulated_walk(&log, 5, usize::MAX).expect("the walk must reach the chain end");
-        assert_eq!(head, log.head());
-        // Any other announced head is a mismatch, no matter how many
-        // windows the walk needed.
-        assert_ne!(head, [0xff; 32]);
-    }
-
-    #[test]
-    fn hard_capped_walk_reports_incomplete() {
-        // A walk that never sees the chain end reports nothing, so the
-        // caller fails the audit instead of trusting a partial chain.
-        let dir = scratch_dir("audit-cap");
-        let provider = Identity::generate();
-        let mut log = ReceiptLog::load(&dir).unwrap();
-        for n in 1..=4 {
-            log.append(signed_receipt(&format!("t{n}"), &provider))
-                .unwrap();
-        }
-        assert!(simulated_walk(&log, 1, 2).is_none());
-    }
-}
+mod tests;

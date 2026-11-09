@@ -74,6 +74,9 @@ pub struct Ctx {
     pub audited_heads: AuditedHeads,
     /// Process-wide operation counters for `opennetctl status`.
     pub counters: Arc<Counters>,
+    /// Hardware performance score board: observed maxima per component,
+    /// bound to hardware fingerprints and priced into capacity points.
+    pub hwperf: Arc<Mutex<crate::hwperf::HwPerf>>,
     pub shutdown: watch::Sender<bool>,
     pub compute: mpsc::Sender<Cmd>,
     pub transport: Arc<Transport>,
@@ -108,6 +111,17 @@ async fn run_async(config: Config, shutdown: watch::Sender<bool>) -> Result<()> 
     )
     .context("cannot load node state")?;
     let consent = Consent::load(&config.paths.state_dir, &config.swarm);
+    // Load the hardware score board and reset exactly the components
+    // whose fingerprints no longer match; a plain reboot resets nothing.
+    let mut hwperf =
+        crate::hwperf::HwPerf::load(&config.paths.state_dir).context("cannot load hwperf")?;
+    let reset = hwperf.reconcile_fingerprints();
+    if !reset.is_empty() {
+        crate::log::warn(
+            module_path!(),
+            &format!("[hwperf] hardware change detected; reset scores: {}", reset.join(", ")),
+        );
+    }
     let transport = Arc::new(
         Transport::new(
             identity.clone(),
@@ -140,6 +154,7 @@ async fn run_async(config: Config, shutdown: watch::Sender<bool>) -> Result<()> 
         receipt_windows: Arc::new(Mutex::new(HashMap::new())),
         audited_heads: Arc::new(Mutex::new(HashMap::new())),
         counters: Arc::new(Counters::default()),
+        hwperf: Arc::new(Mutex::new(hwperf)),
         shutdown: shutdown.clone(),
         compute: compute_tx,
         transport,
@@ -150,6 +165,12 @@ async fn run_async(config: Config, shutdown: watch::Sender<bool>) -> Result<()> 
         ctx.transport.advertise_id(),
     );
     heartbeat::spawn(ctx.clone());
+    if config.hwperf.enabled {
+        tokio::spawn(crate::hwperf::probe::run(
+            ctx.hwperf.clone(),
+            config.hwperf.clone(),
+        ));
+    }
     control::spawn(ctx.clone());
     provider::run(ctx.clone(), compute_rx);
     wan::spawn(ctx.clone());
@@ -195,6 +216,7 @@ async fn run_async(config: Config, shutdown: watch::Sender<bool>) -> Result<()> 
     swarm::leave::broadcast_leave(&ctx).await;
     swarm::leave::shutdown_plans(&ctx).await;
     ctx.reputation.lock().await.flush();
+    let _ = ctx.hwperf.lock().await.save();
     let _ = ctx.state.lock().await.save();
     let _ = std::fs::remove_file(&config.paths.socket_path);
     Ok(())

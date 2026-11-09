@@ -171,6 +171,20 @@ pub async fn handle_receipt_request_frame(ctx: &Arc<Ctx>, src: &str, request: Me
         ctx.reputation.lock().await.record_invalid(src);
         return;
     }
+    // The journal is served to verified network members only: the
+    // requester must hold a routing-table entry under its own node id,
+    // so a random passerby cannot enumerate the node's billing history.
+    let requester = crate::node::identity::Identity::node_id_from_pubkey(&pubkey);
+    if ctx
+        .dht
+        .lock()
+        .await
+        .find_by_exact_node_id(&requester)
+        .is_none()
+    {
+        ctx.reputation.lock().await.record_invalid(src);
+        return;
+    }
     let response = {
         let state = ctx.state.lock().await;
         build_receipt_response(
